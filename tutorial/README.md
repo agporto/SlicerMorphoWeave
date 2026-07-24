@@ -202,7 +202,7 @@ Global (RANSAC) and rigid (ICP) registration that register the source point clou
 </p>
 
 3) Run deformable alignment.
-Registration where source point cloud is deformed to target point cloud, then the registration is used to propagate the source landmarks to target specimen. Uses atlas/SSM as biological prior to avoid biologically implausible deformations (bioCPD) followed by CPD (coherent point drift) to capture local details.
+Registration where source point cloud is deformed to target point cloud, then the registration is used to propagate the source landmarks to target specimen. Uses rustcpd atlas/SSM registration as a biological prior to avoid biologically implausible deformations, followed by deformable CPD to capture local details.
 
 <p align="center">
 <img src="images/18.png" width = 600>
@@ -250,7 +250,7 @@ These steps are especially important for macroevolutionary comparative analyses 
 
 The current backend will either produce an optimized template or retain the baseline when it is already a good fit. The experimental backend applies the selected SSM shape in the original template frame and reports score margin, effective pose count, and evaluated/refined hypothesis counts. Pose-EM does not bypass any downstream stage: Single Run and Batch still perform the standard prescaling, RANSAC + ICP rigid alignment, PCA-CPD, and optional fine deformation.
 
-Pose-EM settings use rustcpd's real-data algorithmic configuration: an exact budget of 193 total pose hypotheses, trajectory scoring after eight coarse iterations with all 193 hypotheses retained, 12 finalists, full-source/1,600-target refinement for 30 iterations, and pose-specific SSM/outlier weights of 0.1/0.05. These pose-specific weights are independent of downstream PCA-CPD. Landmark Transfer retains the existing pose-worker setting; rustcpd runs serially when it is 1 and uses its deterministic internal parallel pool for any other value. The initializer's already-refined coefficients are applied directly in the template frame, without a second dense completion. For incomplete targets, `Target completeness` prescales the SSM and fixes initializer scale; inspect ambiguity diagnostics carefully because partial or symmetric anatomy may support several poses.
+Pose-EM settings use the recommended rustcpd configuration: an exact budget of 193 total pose hypotheses, trajectory scoring after eight coarse iterations with all 193 hypotheses retained, 12 finalists, full-source/1,600-target refinement for 30 iterations, and pose-specific SSM/outlier weights of 0.1/0.05. These pose-specific weights are independent of downstream PCA-CPD. Parallel pose search is enabled by default and uses rustcpd's deterministic internal pool. The initializer's refined coefficients are applied directly in the template frame. For incomplete targets, `Target completeness` prescales the SSM and fixes initializer scale; inspect ambiguity diagnostics carefully because partial or symmetric anatomy may support several poses.
 
 <p align="center">
 <img src="images/23.png" width = 600>

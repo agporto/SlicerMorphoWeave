@@ -190,16 +190,17 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
         and requirement["minimum"] <= version < requirement["maximum"]
       )
 
-    def hasPoseRealDataAPI():
+    def hasPoseAPI():
       if not hasCompatibleDistribution("rustcpd"):
         return False
       try:
         rustcpd_module = importlib.import_module("rustcpd")
-        initializer = getattr(rustcpd_module, "pose_marginalized_initialization")
+        initializer = getattr(rustcpd_module, "pose_initialize")
         parameters = inspect.signature(initializer).parameters
         return all(name in parameters for name in (
           "coarse_screen_iterations", "coarse_survivor_count",
-          "coarse_score_mode", "refine_source_count", "n_jobs",
+          "coarse_score_mode", "refine_source_count",
+          "lambda_regularization", "parallel",
         ))
       except Exception:
         return False
@@ -209,7 +210,7 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
       name for name in required
       if not hasCompatibleDistribution(name)
     ]
-    if not hasPoseRealDataAPI() and "rustcpd" not in missing:
+    if not hasPoseAPI() and "rustcpd" not in missing:
       missing.append("rustcpd")
     if legacy_tiny3d_installed and "tiny3d-rs" not in missing:
       # Both distributions own the same tiny3d import package. Reinstall the
@@ -274,9 +275,9 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
         importlib.import_module(module_name)
       if not hasCompatibleDistribution("tiny3d-rs"):
         raise RuntimeError("A compatible tiny3d-rs>=2.1,<3 distribution is not installed.")
-      if not hasPoseRealDataAPI():
+      if not hasPoseAPI():
         raise RuntimeError(
-          "The installed rustcpd>=3.0,<4 wheel does not provide the required Pose-EM API."
+          "The installed rustcpd>=3.0,<4 wheel does not provide the required native Pose-EM API."
         )
     except Exception as error:
       slicer.util.errorDisplay(f"Landmark Transfer dependency installation failed:\n{error}\n{traceback.format_exc()}")
@@ -437,7 +438,7 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
       "poseOutlierWeight": float(self.poseOutlierWeight.value),
       "poseIdentityPrior": float(self.poseIdentityPrior.value),
       "poseSeed": int(self.poseSeed.value),
-      "poseNJobs": int(self.poseNJobs.value),
+      "poseParallel": bool(self.poseParallel.checked),
     })
     return parameters
 
@@ -570,7 +571,7 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
 
     self.poseOptimizationBox=ctk.ctkCollapsibleButton(); self.poseOptimizationBox.text="Experimental pose-EM settings"; self.poseOptimizationBox.collapsed=True
     poseOptL=qt.QFormLayout(self.poseOptimizationBox); optL.addRow(self.poseOptimizationBox)
-    poseHelp=qt.QLabel("The defaults below match rustcpd's real-data registration configuration: trajectory scoring, all coarse poses retained, and full-source refinement. Only the selected SSM shape is applied to the template; standard scaling, rigid alignment, and deformable registration still run afterward.")
+    poseHelp=qt.QLabel("The defaults below use the recommended rustcpd registration configuration: trajectory scoring, all coarse poses retained, and full-source refinement. Only the selected SSM shape is applied to the template; standard scaling, rigid alignment, and deformable registration still run afterward.")
     poseHelp.setWordWrap(True); poseOptL.addRow(poseHelp)
     self.poseRotationCount=qt.QSpinBox(); self.poseRotationCount.minimum=12; self.poseRotationCount.maximum=2048; self.poseRotationCount.value=193; self.poseRotationCount.setToolTip("Exact total hypothesis budget, including the identity and global/local rotation samples."); poseOptL.addRow("Total pose hypotheses:", self.poseRotationCount)
     self.poseCoarseSourceCount=qt.QSpinBox(); self.poseCoarseSourceCount.minimum=20; self.poseCoarseSourceCount.maximum=10000; self.poseCoarseSourceCount.value=400; poseOptL.addRow("Coarse source points:", self.poseCoarseSourceCount)
@@ -579,16 +580,16 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
     self.poseCoarseIterations=qt.QSpinBox(); self.poseCoarseIterations.minimum=1; self.poseCoarseIterations.maximum=100; self.poseCoarseIterations.value=8; poseOptL.addRow("Coarse EM iterations:", self.poseCoarseIterations)
     self.poseCoarseScreenIterations=qt.QSpinBox(); self.poseCoarseScreenIterations.minimum=1; self.poseCoarseScreenIterations.maximum=100; self.poseCoarseScreenIterations.value=8; self.poseCoarseScreenIterations.setToolTip("Iterations completed before optional screening; equal to coarse iterations by default, so every pose completes the coarse stage."); poseOptL.addRow("Screen after iteration:", self.poseCoarseScreenIterations)
     self.poseCoarseSurvivorCount=qt.QSpinBox(); self.poseCoarseSurvivorCount.minimum=1; self.poseCoarseSurvivorCount.maximum=2048; self.poseCoarseSurvivorCount.value=193; self.poseCoarseSurvivorCount.setToolTip("Number of hypotheses retained after screening. The default retains the entire 193-pose budget."); poseOptL.addRow("Coarse survivors:", self.poseCoarseSurvivorCount)
-    self.poseCoarseScoreMode=qt.QComboBox(); self.poseCoarseScoreMode.addItem("Trajectory (real-data default)"); self.poseCoarseScoreMode.addItem("Final iteration"); self.poseCoarseScoreMode.setToolTip("Rank coarse poses by their EM objective trajectory or only their final objective."); poseOptL.addRow("Coarse scoring:", self.poseCoarseScoreMode)
+    self.poseCoarseScoreMode=qt.QComboBox(); self.poseCoarseScoreMode.addItem("Trajectory (recommended)"); self.poseCoarseScoreMode.addItem("Final iteration"); self.poseCoarseScoreMode.setToolTip("Rank coarse poses by their EM objective trajectory or only their final objective."); poseOptL.addRow("Coarse scoring:", self.poseCoarseScoreMode)
     self.poseRefineCount=qt.QSpinBox(); self.poseRefineCount.minimum=1; self.poseRefineCount.maximum=64; self.poseRefineCount.value=12; poseOptL.addRow("Pose finalists:", self.poseRefineCount)
-    self.poseRefineSourceCount=qt.QSpinBox(); self.poseRefineSourceCount.minimum=0; self.poseRefineSourceCount.maximum=50000; self.poseRefineSourceCount.value=0; self.poseRefineSourceCount.setSpecialValueText("Full source"); self.poseRefineSourceCount.setToolTip("Use 0 for all source points, matching the real-data default."); poseOptL.addRow("Refinement source points:", self.poseRefineSourceCount)
+    self.poseRefineSourceCount=qt.QSpinBox(); self.poseRefineSourceCount.minimum=0; self.poseRefineSourceCount.maximum=50000; self.poseRefineSourceCount.value=0; self.poseRefineSourceCount.setSpecialValueText("Full source"); self.poseRefineSourceCount.setToolTip("Use 0 for all source points, matching the recommended default."); poseOptL.addRow("Refinement source points:", self.poseRefineSourceCount)
     self.poseRefineTargetCount=qt.QSpinBox(); self.poseRefineTargetCount.minimum=50; self.poseRefineTargetCount.maximum=50000; self.poseRefineTargetCount.value=1600; poseOptL.addRow("Refinement target points:", self.poseRefineTargetCount)
     self.poseRefineIterations=qt.QSpinBox(); self.poseRefineIterations.minimum=1; self.poseRefineIterations.maximum=250; self.poseRefineIterations.value=30; poseOptL.addRow("Refinement EM iterations:", self.poseRefineIterations)
     self.poseLambdaReg=qt.QDoubleSpinBox(); self.poseLambdaReg.minimum=0.0; self.poseLambdaReg.maximum=5.0; self.poseLambdaReg.singleStep=0.01; self.poseLambdaReg.decimals=3; self.poseLambdaReg.value=0.10; self.poseLambdaReg.setToolTip("Pose-initializer SSM regularization; independent of downstream PCA-CPD settings."); poseOptL.addRow("Pose SSM weight:", self.poseLambdaReg)
     self.poseOutlierWeight=qt.QDoubleSpinBox(); self.poseOutlierWeight.minimum=0.0; self.poseOutlierWeight.maximum=0.99; self.poseOutlierWeight.singleStep=0.01; self.poseOutlierWeight.decimals=2; self.poseOutlierWeight.value=0.05; self.poseOutlierWeight.setToolTip("Pose-initializer outlier weight; independent of downstream PCA-CPD settings."); poseOptL.addRow("Pose outlier weight:", self.poseOutlierWeight)
     self.poseIdentityPrior=qt.QDoubleSpinBox(); self.poseIdentityPrior.minimum=0.01; self.poseIdentityPrior.maximum=0.99; self.poseIdentityPrior.singleStep=0.05; self.poseIdentityPrior.decimals=2; self.poseIdentityPrior.value=0.20; poseOptL.addRow("Identity-pose prior:", self.poseIdentityPrior)
     self.poseSeed=qt.QSpinBox(); self.poseSeed.minimum=0; self.poseSeed.maximum=2147483647; self.poseSeed.value=0; poseOptL.addRow("Deterministic seed:", self.poseSeed)
-    self.poseNJobs=qt.QSpinBox(); self.poseNJobs.minimum=1; self.poseNJobs.maximum=128; self.poseNJobs.value=4; self.poseNJobs.setToolTip("Use 1 for serial pose search; values above 1 enable rustcpd's deterministic internal parallel pool."); poseOptL.addRow("Pose workers:", self.poseNJobs)
+    self.poseParallel=qt.QCheckBox(); self.poseParallel.checked=True; self.poseParallel.setToolTip("Use rustcpd's deterministic internal parallel pool for pose hypotheses."); poseOptL.addRow("Parallel pose search:", self.poseParallel)
     self.optimizeButton=qt.QPushButton("Run Template Optimization"); optL.addRow(self.optimizeButton)
 
     # --- Optimization Tab (append this) ---
@@ -1118,7 +1119,7 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
               f"score={info['score']:.3f}, margin={info['score_margin']:.3f}, "
               f"effective poses={info['effective_hypotheses']:.2f}, "
               f"evaluated/refined={info['hypotheses_evaluated']}/{info['hypotheses_refined']}, "
-              f"parallel={'yes' if info['pose_workers_effective'] != 1 else 'no'})."
+              f"parallel={'yes' if info['pose_parallel'] else 'no'})."
           )
           if info["effective_hypotheses"] >= 2.0:
               self._log_opt(
@@ -1243,11 +1244,7 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
                 "coefficient_norm": float(np.linalg.norm(pose_result.coefficients)),
                 "registration_scale": float(pose_result.scale),
                 "registration_size_ratio": float(pose_info.get("size_ratio", np.nan)),
-                "pose_workers_requested": int(pose_info.get("pose_workers_requested", 1)),
-                "pose_workers_effective": int(pose_info.get("pose_workers_effective", 1)),
-                "blas_threads_limited": bool(pose_info.get("blas_threads_limited", False)),
-                "dense_completion_skipped": True,
-                "downstream_rigid": True,
+                "pose_parallel": bool(pose_info.get("pose_parallel", True)),
               }
               if status_callback:
                 status_callback(
@@ -1529,10 +1526,7 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
       "hypotheses_evaluated": int(result.hypotheses_evaluated),
       "hypotheses_refined": int(result.hypotheses_refined),
       "scale": float(result.scale),
-      "pose_workers_requested": int(result.final_parameters["pose_workers_requested"]),
-      "pose_workers_effective": int(result.final_parameters["pose_workers_effective"]),
-      "blas_threads_limited": bool(result.final_parameters["blas_threads_limited"]),
-      "dense_completion_skipped": True,
+      "pose_parallel": bool(result.final_parameters["pose_parallel"]),
       "size_ratio": float(
         np.linalg.norm(np.ptp(registeredCorr, axis=0)) /
         max(np.linalg.norm(np.ptp(target, axis=0)), np.finfo(float).eps)
@@ -1586,7 +1580,7 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
 
       # keep the first k modes/eigenvalues, preserving original order
       modes = modes[:, :, :k]
-      eigvals_eff = eig[:k]#* (scale ** 2)
+      eigvals_eff = eig[:k]
 
       # Rigid rotation for the modes
       if rigidMatrix is None:
@@ -1616,10 +1610,10 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
           np.asarray(src_n),             # source is the SSM base
           U_aligned,
           eigvals_eff,                   # no external scaling/flooring
-          lambda_regularization=float(parameters.get("lambda_reg", 0.4)),  # no scale² here
-          outlier_weight=float(parameters.get("w", 0.2)),
+          lambda_regularization=float(parameters.get("lambda_reg", 0.01)),
+          outlier_weight=float(parameters.get("w", 0.10)),
           tolerance=float(parameters.get("tolerance", 1e-6)),
-          max_iterations=int(parameters.get("max_iterations", 120)),
+          max_iterations=int(parameters.get("max_iterations", 250)),
           with_scale=is_complete,
           normalize=True,
           optimize_similarity=True,
@@ -1638,33 +1632,11 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
           alpha=float(parameters.get("alpha", 2.0)),
           low_rank=max(1, min(300, len(warped_landmarks))),
           tolerance=float(parameters.get("tolerance", 1e-6)),
-          max_iterations=int(parameters.get("max_iterations", 120)),
+          max_iterations=int(parameters.get("max_iterations", 250)),
           k=sparse_k,
       )
       warped_landmarks = np.asarray(final.points)
       return warped_landmarks/s20
-
-  def runFineDeformable(self, sourceLM, targetSLM, parameters):
-      import rustcpd
-      source = np.asarray(sourceLM, dtype=float)
-      target = np.asarray(targetSLM, dtype=float)
-      if bool(parameters.get("skipFineCPD", False)):
-          return source.copy()
-      if source.ndim != 2 or target.ndim != 2 or source.shape[1] != 3 or target.shape[1] != 3:
-          raise ValueError("Fine CPD requires source and target arrays with shape (N, 3).")
-      diag = float(np.linalg.norm(np.ptp(target, axis=0))) if len(target) else 0.0
-      scale = 20.0 / max(diag, 1e-12)
-      final = rustcpd.register_deformable(
-          target * scale,
-          source * scale,
-          beta=float(parameters.get("beta", 2.0)),
-          alpha=float(parameters.get("alpha", 2.0)),
-          low_rank=max(1, min(300, len(source))),
-          tolerance=float(parameters.get("tolerance", 1e-6)),
-          max_iterations=int(parameters.get("max_iterations", 120)),
-          k=max(1, min(10, len(target))),
-      )
-      return np.asarray(final.points) / scale
 
   def _triangulate_polydata(self, pd):
     tf = vtk.vtkTriangleFilter()

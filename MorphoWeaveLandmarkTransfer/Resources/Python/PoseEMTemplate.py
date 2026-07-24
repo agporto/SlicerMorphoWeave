@@ -38,10 +38,15 @@ class PoseEMSettings:
     outlier_weight: float = 0.05
     identity_prior_probability: float = 0.2
     seed: int = 0
-    n_jobs: int = 1
+    parallel: bool = True
 
     @classmethod
     def from_mapping(cls, parameters: Mapping[str, Any]) -> "PoseEMSettings":
+        parallel = (
+            bool(parameters["poseParallel"])
+            if "poseParallel" in parameters
+            else int(parameters.get("poseNJobs", -1)) != 1
+        )
         settings = cls(
             rotation_count=int(parameters.get("poseRotationCount", 193)),
             coarse_source_count=int(parameters.get("poseCoarseSourceCount", 400)),
@@ -63,7 +68,7 @@ class PoseEMSettings:
             outlier_weight=float(parameters.get("poseOutlierWeight", 0.05)),
             identity_prior_probability=float(parameters.get("poseIdentityPrior", 0.2)),
             seed=int(parameters.get("poseSeed", 0)),
-            n_jobs=int(parameters.get("poseNJobs", 1)),
+            parallel=parallel,
         )
         settings.validate()
         return settings
@@ -98,8 +103,6 @@ class PoseEMSettings:
             raise ValueError("outlier_weight must be in [0, 1)")
         if not 0 < self.identity_prior_probability < 1:
             raise ValueError("identity_prior_probability must be in (0, 1)")
-        if self.n_jobs != -1 and self.n_jobs < 1:
-            raise ValueError("n_jobs must be positive or -1")
 
     def initializer_kwargs(self) -> dict[str, Any]:
         return {
@@ -115,16 +118,16 @@ class PoseEMSettings:
             "refine_source_count": self.refine_source_count,
             "refine_target_count": self.refine_target_count,
             "refine_iterations": self.refine_iterations,
-            "lambda_reg": self.lambda_reg,
+            "lambda_regularization": self.lambda_reg,
             "outlier_weight": self.outlier_weight,
             "identity_prior_probability": self.identity_prior_probability,
             "seed": self.seed,
-            "n_jobs": self.n_jobs,
+            "parallel": self.parallel,
         }
 
 
-def _require_real_data_initializer(initializer: Callable[..., Any]) -> None:
-    """Fail clearly when the rustcpd compatibility initializer is incomplete."""
+def _require_native_pose_initializer(initializer: Callable[..., Any]) -> None:
+    """Fail clearly when the rustcpd native pose initializer is incomplete."""
     parameters = inspect.signature(initializer).parameters
     if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
         return
@@ -133,12 +136,13 @@ def _require_real_data_initializer(initializer: Callable[..., Any]) -> None:
         "coarse_survivor_count",
         "coarse_score_mode",
         "refine_source_count",
-        "n_jobs",
+        "lambda_regularization",
+        "parallel",
     }
     missing = sorted(required.difference(parameters))
     if missing:
         raise RuntimeError(
-            "Pose EM template optimization requires the rustcpd real-data "
+            "Pose EM template optimization requires the rustcpd native "
             "initializer API; the installed build is missing: " + ", ".join(missing)
         )
 
@@ -253,7 +257,7 @@ def _adapt_rustcpd_initialization(initialization: Any) -> Any:
 
 def _rustcpd_api() -> Callable[..., Any]:
     try:
-        from rustcpd import pose_marginalized_initialization
+        from rustcpd import pose_initialize
     except (ImportError, AttributeError) as exc:
         raise RuntimeError(
             "Pose EM template optimization requires rustcpd 3 or newer. "
@@ -262,25 +266,10 @@ def _rustcpd_api() -> Callable[..., Any]:
 
     def initialize(*args: Any, **kwargs: Any) -> Any:
         return _adapt_rustcpd_initialization(
-            pose_marginalized_initialization(*args, **kwargs)
+            pose_initialize(*args, **kwargs)
         )
 
     return initialize
-
-
-def _initialize_with_thread_policy(
-    initializer: Callable[..., Any],
-    initializer_args: tuple[Any, ...],
-    initializer_kwargs: Mapping[str, Any],
-    requested_n_jobs: int,
-    controller_factory: Optional[Callable[[], Any]] = None,
-) -> tuple[Any, int, bool]:
-    """Forward the legacy worker setting to rustcpd's compatibility wrapper."""
-    del controller_factory  # Retained for callers using the previous helper signature.
-    effective_n_jobs = int(requested_n_jobs)
-    kwargs = dict(initializer_kwargs)
-    kwargs["n_jobs"] = effective_n_jobs
-    return initializer(*initializer_args, **kwargs), effective_n_jobs, False
 
 
 def run_pose_em_registration(
@@ -293,7 +282,6 @@ def run_pose_em_registration(
     with_scale: bool,
     source_scale: float = 1.0,
     initializer: Optional[Callable[..., Any]] = None,
-    controller_factory: Optional[Callable[[], Any]] = None,
 ) -> PoseEMRegistrationResult:
     mean, modes, eigenvalues = validate_ssm(mean, modes, eigenvalues)
     target = np.asarray(target, dtype=np.float64)
@@ -312,14 +300,18 @@ def run_pose_em_registration(
     working_modes = modes * float(source_scale)
     if initializer is None:
         initializer = _rustcpd_api()
-    _require_real_data_initializer(initializer)
+    _require_native_pose_initializer(initializer)
 
-    initial, effective_n_jobs, blas_limited = _initialize_with_thread_policy(
-        initializer,
-        (working_mean, working_target, working_modes, eigenvalues),
-        settings.initializer_kwargs(),
-        settings.n_jobs,
-        controller_factory=controller_factory,
+    working_modes_flat = working_modes.reshape(
+        working_mean.size,
+        working_modes.shape[2],
+    )
+    initial = initializer(
+        working_mean,
+        working_target,
+        working_modes_flat,
+        eigenvalues,
+        **settings.initializer_kwargs(),
     )
     coefficients = np.asarray(initial.coefficients, dtype=np.float64).reshape(-1)
     rotation = np.asarray(initial.rotation, dtype=np.float64)
@@ -352,10 +344,7 @@ def run_pose_em_registration(
         "source_centroid": source_centroid.copy(),
         "target_centroid": target_centroid.copy(),
         "source_scale": float(source_scale),
-        "pose_workers_requested": int(settings.n_jobs),
-        "pose_workers_effective": effective_n_jobs,
-        "blas_threads_limited": blas_limited,
-        "dense_completion_skipped": True,
+        "pose_parallel": bool(settings.parallel),
     }
     return PoseEMRegistrationResult(
         points=points,

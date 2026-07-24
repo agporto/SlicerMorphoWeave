@@ -52,6 +52,7 @@ from Resources.Python.PoseEMTemplate import (
 
 def _initializer(coefficients, rotation, scale, translation):
     def initialize(*args, **kwargs):
+        initialize.args.append(args)
         initialize.calls.append(kwargs)
         return SimpleNamespace(
             coefficients=np.asarray(coefficients),
@@ -65,6 +66,7 @@ def _initializer(coefficients, rotation, scale, translation):
             hypotheses_evaluated=61,
             hypotheses_refined=2,
         )
+    initialize.args = []
     initialize.calls = []
     return initialize
 
@@ -97,6 +99,15 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
         self.assertIn("rustcpd.register_deformable", source)
         self.assertIn("np.asarray(pca.points)", source)
         self.assertIn("np.asarray(final.points)", source)
+        self.assertIn('getattr(rustcpd_module, "pose_initialize")', source)
+        self.assertNotIn("pose_marginalized_initialization", source)
+        self.assertNotIn("runFineDeformable", source)
+        self.assertNotIn("blas_threads_limited", source)
+        self.assertNotIn("dense_completion_skipped", source)
+        self.assertNotIn("downstream_rigid", source)
+        self.assertIn('parameters.get("lambda_reg", 0.01)', source)
+        self.assertIn('parameters.get("w", 0.10)', source)
+        self.assertIn('parameters.get("max_iterations", 250)', source)
         self.assertNotIn("from biocpd", source)
         self.assertNotIn("from packaging", source)
         self.assertIn("slicer.util.pip_install", source)
@@ -149,7 +160,7 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             optimization_backend({"optimizationBackend": "unknown"})
 
-    def test_settings_map_ui_values_to_rustcpd_compatibility_arguments(self):
+    def test_settings_map_ui_values_to_native_rustcpd_arguments(self):
         settings = PoseEMSettings.from_mapping({
             "poseRotationCount": 24,
             "poseCoarseSourceCount": 80,
@@ -167,7 +178,7 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
             "poseOutlierWeight": 0.15,
             "poseIdentityPrior": 0.25,
             "poseSeed": 7,
-            "poseNJobs": 2,
+            "poseParallel": False,
         })
         self.assertEqual(settings.rotation_count, 24)
         self.assertEqual(settings.refine_count, 1)
@@ -185,14 +196,24 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
             "refine_source_count": 70,
             "refine_target_count": 120,
             "refine_iterations": 9,
-            "lambda_reg": 0.03,
+            "lambda_regularization": 0.03,
             "outlier_weight": 0.15,
             "identity_prior_probability": 0.25,
             "seed": 7,
-            "n_jobs": 2,
+            "parallel": False,
         })
 
-    def test_defaults_match_rustcpd_real_data_configuration(self):
+    def test_legacy_pose_worker_input_maps_to_parallel_boolean(self):
+        self.assertFalse(PoseEMSettings.from_mapping({"poseNJobs": 1}).parallel)
+        self.assertTrue(PoseEMSettings.from_mapping({"poseNJobs": 2}).parallel)
+        self.assertFalse(
+            PoseEMSettings.from_mapping({
+                "poseNJobs": 4,
+                "poseParallel": False,
+            }).parallel
+        )
+
+    def test_defaults_match_recommended_rustcpd_configuration(self):
         settings = PoseEMSettings.from_mapping({})
         self.assertEqual(settings.rotation_count, 193)
         self.assertEqual(settings.coarse_screen_iterations, 8)
@@ -201,9 +222,9 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
         self.assertIsNone(settings.refine_source_count)
         self.assertEqual(settings.lambda_reg, 0.1)
         self.assertEqual(settings.outlier_weight, 0.05)
-        self.assertEqual(settings.n_jobs, 1)
+        self.assertTrue(settings.parallel)
 
-    def test_ui_uses_exact_real_data_defaults(self):
+    def test_ui_uses_recommended_native_rustcpd_defaults(self):
         source = (MODULE_DIR / "MorphoWeaveLandmarkTransfer.py").read_text(encoding="utf-8")
         self.assertIn('poseOptL.addRow("Total pose hypotheses:", self.poseRotationCount)', source)
         self.assertIn("self.poseRotationCount.value=193", source)
@@ -211,39 +232,48 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
         self.assertIn('self.poseRefineSourceCount.setSpecialValueText("Full source")', source)
         self.assertIn("self.poseLambdaReg.value=0.10", source)
         self.assertIn("self.poseOutlierWeight.value=0.05", source)
-        self.assertIn("self.poseNJobs.value=4", source)
+        self.assertIn("self.poseParallel.checked=True", source)
+        self.assertIn('"poseParallel": bool(self.poseParallel.checked)', source)
+        self.assertNotIn('"poseNJobs":', source)
 
-    def test_requested_worker_setting_is_forwarded_to_rustcpd_wrapper(self):
+    def test_parallel_setting_and_flattened_modes_are_forwarded_to_native_rustcpd(self):
         mean = np.array([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
         modes = np.zeros((2, 3, 1))
         initializer = _initializer([0.0], np.eye(3), 1.0, [[0.0, 0.0, 0.0]])
         result = run_pose_em_registration(
             mean, mean, modes, np.array([1.0]),
-            PoseEMSettings(rotation_count=12, n_jobs=4),
+            PoseEMSettings(rotation_count=12, parallel=True),
             with_scale=True,
             initializer=initializer,
         )
-        self.assertEqual(initializer.calls[0]["n_jobs"], 4)
-        self.assertEqual(result.final_parameters["pose_workers_effective"], 4)
-        self.assertFalse(result.final_parameters["blas_threads_limited"])
+        self.assertTrue(initializer.calls[0]["parallel"])
+        self.assertEqual(initializer.calls[0]["lambda_regularization"], 0.1)
+        self.assertEqual(initializer.args[0][2].shape, (mean.size, 1))
+        self.assertTrue(result.final_parameters["pose_parallel"])
+        self.assertNotIn("blas_threads_limited", result.final_parameters)
+        self.assertNotIn("dense_completion_skipped", result.final_parameters)
 
-    def test_serial_worker_setting_is_forwarded_to_rustcpd_wrapper(self):
+    def test_serial_pose_setting_is_forwarded_to_native_rustcpd(self):
         mean = np.array([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
         modes = np.zeros((2, 3, 1))
         initializer = _initializer([0.0], np.eye(3), 1.0, [[0.0, 0.0, 0.0]])
         result = run_pose_em_registration(
             mean, mean, modes, np.array([1.0]),
-            PoseEMSettings(rotation_count=12, n_jobs=1),
+            PoseEMSettings(rotation_count=12, parallel=False),
             with_scale=True,
             initializer=initializer,
         )
-        self.assertEqual(initializer.calls[0]["n_jobs"], 1)
-        self.assertEqual(result.final_parameters["pose_workers_effective"], 1)
-        self.assertFalse(result.final_parameters["blas_threads_limited"])
+        self.assertFalse(initializer.calls[0]["parallel"])
+        self.assertFalse(result.final_parameters["pose_parallel"])
 
-    def test_template_selection_skips_redundant_dense_completion(self):
+    def test_template_selection_omits_redundant_dense_completion(self):
         helper = (MODULE_DIR / "Resources/Python/PoseEMTemplate.py").read_text(encoding="utf-8")
         self.assertNotIn("registration.register()", helper)
+        self.assertNotIn("dense_completion_skipped", helper)
+        self.assertNotIn("controller_factory", helper)
+        self.assertNotIn("n_jobs", helper)
+        self.assertNotIn("pose_marginalized_initialization", helper)
+        self.assertIn("from rustcpd import pose_initialize", helper)
 
     def test_ssm_sample_uses_native_coefficients_without_sqrt_eigen_scaling(self):
         mean = np.zeros((2, 3))
@@ -303,7 +333,6 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
             atol=1e-12,
         )
         self.assertEqual(result.hypotheses_evaluated, 61)
-        self.assertTrue(result.final_parameters["dense_completion_skipped"])
 
     def test_fixed_scale_handoff_recenters_pose_and_disables_scale_optimization(self):
         mean = np.array([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
@@ -335,9 +364,9 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
 
 
 class PoseEMTemplateIntegrationTest(unittest.TestCase):
-    def test_small_offset_target_retains_template_shape_without_dense_completion(self):
+    def test_small_offset_target_retains_template_shape_without_redundant_completion(self):
         try:
-            from rustcpd import pose_marginalized_initialization
+            from rustcpd import pose_initialize
         except (ImportError, AttributeError):
             self.skipTest("rustcpd pose-EM API is unavailable")
         rng = np.random.default_rng(17)
@@ -368,11 +397,10 @@ class PoseEMTemplateIntegrationTest(unittest.TestCase):
         selected_shape = ssm_sample(mean, modes, result.coefficients)
         self.assertGreater(np.linalg.norm(np.ptp(selected_shape, axis=0)), 0.9)
         self.assertTrue(np.isfinite(result.coefficients).all())
-        self.assertTrue(result.final_parameters["dense_completion_skipped"])
 
     def test_large_rotation_recovery_through_rustcpd_adapter(self):
         try:
-            from rustcpd import pose_marginalized_initialization
+            from rustcpd import pose_initialize
         except (ImportError, AttributeError):
             self.skipTest("rustcpd pose-EM API is unavailable")
         rng = np.random.default_rng(19)
