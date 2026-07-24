@@ -34,8 +34,8 @@ class PoseEMSettings:
     refine_source_count: Optional[int] = None
     refine_target_count: int = 1600
     refine_iterations: int = 30
-    lambda_reg: float = 0.1
-    outlier_weight: float = 0.05
+    lambda_reg: float = 5.0
+    outlier_weight: float = 0.15
     identity_prior_probability: float = 0.2
     seed: int = 0
     parallel: bool = True
@@ -64,8 +64,8 @@ class PoseEMSettings:
             ),
             refine_target_count=int(parameters.get("poseRefineTargetCount", 1600)),
             refine_iterations=int(parameters.get("poseRefineIterations", 30)),
-            lambda_reg=float(parameters.get("poseLambdaReg", 0.1)),
-            outlier_weight=float(parameters.get("poseOutlierWeight", 0.05)),
+            lambda_reg=float(parameters.get("poseLambdaReg", 5.0)),
+            outlier_weight=float(parameters.get("poseOutlierWeight", 0.15)),
             identity_prior_probability=float(parameters.get("poseIdentityPrior", 0.2)),
             seed=int(parameters.get("poseSeed", 0)),
             parallel=parallel,

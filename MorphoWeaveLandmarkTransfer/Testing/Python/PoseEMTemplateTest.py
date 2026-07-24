@@ -213,25 +213,26 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
             }).parallel
         )
 
-    def test_defaults_match_recommended_rustcpd_configuration(self):
+    def test_defaults_match_morphoweave_rustcpd_configuration(self):
         settings = PoseEMSettings.from_mapping({})
         self.assertEqual(settings.rotation_count, 193)
         self.assertEqual(settings.coarse_screen_iterations, 8)
         self.assertEqual(settings.coarse_survivor_count, 193)
         self.assertEqual(settings.coarse_score_mode, "trajectory")
         self.assertIsNone(settings.refine_source_count)
-        self.assertEqual(settings.lambda_reg, 0.1)
-        self.assertEqual(settings.outlier_weight, 0.05)
+        self.assertEqual(settings.lambda_reg, 5.0)
+        self.assertEqual(settings.outlier_weight, 0.15)
         self.assertTrue(settings.parallel)
 
-    def test_ui_uses_recommended_native_rustcpd_defaults(self):
+    def test_ui_uses_morphoweave_native_rustcpd_defaults(self):
         source = (MODULE_DIR / "MorphoWeaveLandmarkTransfer.py").read_text(encoding="utf-8")
         self.assertIn('poseOptL.addRow("Total pose hypotheses:", self.poseRotationCount)', source)
         self.assertIn("self.poseRotationCount.value=193", source)
         self.assertIn('"poseCoarseScoreMode": "trajectory" if scoreModeIndex == 0 else "final"', source)
         self.assertIn('self.poseRefineSourceCount.setSpecialValueText("Full source")', source)
-        self.assertIn("self.poseLambdaReg.value=0.10", source)
-        self.assertIn("self.poseOutlierWeight.value=0.05", source)
+        self.assertIn("self.poseLambdaReg.maximum=20.0", source)
+        self.assertIn("self.poseLambdaReg.value=5.0", source)
+        self.assertIn("self.poseOutlierWeight.value=0.15", source)
         self.assertIn("self.poseParallel.checked=True", source)
         self.assertIn('"poseParallel": bool(self.poseParallel.checked)', source)
         self.assertNotIn('"poseNJobs":', source)
@@ -247,7 +248,7 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
             initializer=initializer,
         )
         self.assertTrue(initializer.calls[0]["parallel"])
-        self.assertEqual(initializer.calls[0]["lambda_regularization"], 0.1)
+        self.assertEqual(initializer.calls[0]["lambda_regularization"], 5.0)
         self.assertEqual(initializer.args[0][2].shape, (mean.size, 1))
         self.assertTrue(result.final_parameters["pose_parallel"])
         self.assertNotIn("blas_threads_limited", result.final_parameters)
