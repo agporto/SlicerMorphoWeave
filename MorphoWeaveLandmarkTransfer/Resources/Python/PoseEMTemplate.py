@@ -124,7 +124,7 @@ class PoseEMSettings:
 
 
 def _require_real_data_initializer(initializer: Callable[..., Any]) -> None:
-    """Fail clearly when an older 1.3.0 build is present under the same version."""
+    """Fail clearly when the rustcpd compatibility initializer is incomplete."""
     parameters = inspect.signature(initializer).parameters
     if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
         return
@@ -138,7 +138,7 @@ def _require_real_data_initializer(initializer: Callable[..., Any]) -> None:
     missing = sorted(required.difference(parameters))
     if missing:
         raise RuntimeError(
-            "Pose EM template optimization requires the biocpd real-data "
+            "Pose EM template optimization requires the rustcpd real-data "
             "initializer API; the installed build is missing: " + ", ".join(missing)
         )
 
@@ -234,15 +234,38 @@ def fixed_scale_translation(source: np.ndarray, target: np.ndarray, rotation: np
     return (target.mean(axis=0) - source.mean(axis=0) @ rotation.T).reshape(1, 3)
 
 
-def _biocpd_api() -> Callable[..., Any]:
+class _RustPoseInitializationAdapter:
+    """Expose rustcpd's direct-row rotation in MorphoWeave's legacy convention."""
+
+    def __init__(self, initialization: Any):
+        self._initialization = initialization
+        # rustcpd 3 applies row points as points @ rotation. MorphoWeave's
+        # established internal convention applies points @ rotation.T.
+        self.rotation = np.asarray(initialization.rotation, dtype=np.float64).T.copy()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._initialization, name)
+
+
+def _adapt_rustcpd_initialization(initialization: Any) -> Any:
+    return _RustPoseInitializationAdapter(initialization)
+
+
+def _rustcpd_api() -> Callable[..., Any]:
     try:
-        from biocpd import pose_marginalized_initialization
+        from rustcpd import pose_marginalized_initialization
     except (ImportError, AttributeError) as exc:
         raise RuntimeError(
-            "Pose EM template optimization requires biocpd 1.3 or newer. "
-            "Upgrade biocpd in the Slicer Python environment."
+            "Pose EM template optimization requires rustcpd 3 or newer. "
+            "Upgrade rustcpd in the Slicer Python environment."
         ) from exc
-    return pose_marginalized_initialization
+
+    def initialize(*args: Any, **kwargs: Any) -> Any:
+        return _adapt_rustcpd_initialization(
+            pose_marginalized_initialization(*args, **kwargs)
+        )
+
+    return initialize
 
 
 def _initialize_with_thread_policy(
@@ -252,33 +275,12 @@ def _initialize_with_thread_policy(
     requested_n_jobs: int,
     controller_factory: Optional[Callable[[], Any]] = None,
 ) -> tuple[Any, int, bool]:
-    """Limit nested BLAS threads when supported, otherwise use one pose worker."""
-    if controller_factory is None:
-        try:
-            from threadpoolctl import ThreadpoolController
-        except ImportError:
-            ThreadpoolController = None
-        controller_factory = ThreadpoolController
-
-    controller = None
-    if controller_factory is not None:
-        try:
-            candidate = controller_factory()
-            if candidate.select(user_api="blas").lib_controllers:
-                controller = candidate
-        except Exception:
-            controller = None
-
-    effective_n_jobs = int(requested_n_jobs) if controller is not None else 1
+    """Forward the legacy worker setting to rustcpd's compatibility wrapper."""
+    del controller_factory  # Retained for callers using the previous helper signature.
+    effective_n_jobs = int(requested_n_jobs)
     kwargs = dict(initializer_kwargs)
     kwargs["n_jobs"] = effective_n_jobs
-    if controller is None:
-        return initializer(*initializer_args, **kwargs), effective_n_jobs, False
-
-    # Keep the limit local to Pose EM. Independent hypotheses run in Python
-    # workers while each supported BLAS backend stays sequential.
-    with controller.limit(limits=1, user_api="blas"):
-        return initializer(*initializer_args, **kwargs), effective_n_jobs, True
+    return initializer(*initializer_args, **kwargs), effective_n_jobs, False
 
 
 def run_pose_em_registration(
@@ -309,7 +311,7 @@ def run_pose_em_registration(
     working_target = target - target_centroid
     working_modes = modes * float(source_scale)
     if initializer is None:
-        initializer = _biocpd_api()
+        initializer = _rustcpd_api()
     _require_real_data_initializer(initializer)
 
     initial, effective_n_jobs, blas_limited = _initialize_with_thread_policy(
@@ -330,8 +332,8 @@ def run_pose_em_registration(
         translation = fixed_scale_translation(initial_shape, working_target, rotation)
 
     # The initializer has already refined its finalists. Template optimization
-    # needs only those coefficients; a second dense AtlasRegistration pass was
-    # redundant and its registered coordinates were discarded by MorphoWeaveLandmarkTransfer.
+    # needs only those coefficients; a second dense atlas pass was redundant
+    # and its registered coordinates were discarded by MorphoWeaveLandmarkTransfer.
     points_centered = scale * (initial_shape @ rotation.T) + translation
     final_scale = float(source_scale) * scale
     final_translation = (

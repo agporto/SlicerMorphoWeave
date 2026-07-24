@@ -1,4 +1,4 @@
-import os, logging, copy, json, time, html, numpy as np
+import os, logging, copy, json, time, html, re, numpy as np
 import vtk, qt, ctk, slicer
 from slicer.ScriptedLoadableModule import *
 import vtk.util.numpy_support as vtk_np
@@ -16,6 +16,14 @@ from Resources.Python.PoseEMTemplate import (
 )
 
 # ---------- Small utilities----------
+
+def stable_distribution_release(version_text):
+  """Return stable release components, rejecting prerelease version strings."""
+  match = re.fullmatch(
+    r"\s*(\d+(?:\.\d+)*)(?:\.post\d+)?(?:\+[A-Za-z0-9][A-Za-z0-9._-]*)?\s*",
+    str(version_text),
+  )
+  return tuple(int(part) for part in match.group(1).split(".")) if match else None
 
 def setWorkflowStatus(label, state, detail):
   title, color = {
@@ -141,51 +149,139 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
 
   # ----- Slicer-native dependency installer -----
   def _ensure_dependencies(self):
-    import importlib.util, inspect, traceback, sys
-    required=[("tiny3d","tiny3d"),("biocpd","biocpd>=1.3")]
+    import importlib, importlib.metadata, inspect, traceback, sys
+
+    required = {
+      "tiny3d-rs": {
+        "spec": "tiny3d-rs>=2.1,<3",
+        "module": "tiny3d",
+        "minimum": (2, 1),
+        "maximum": (3,),
+      },
+      "rustcpd": {
+        "spec": "rustcpd>=3.0,<4",
+        "module": "rustcpd",
+        "minimum": (3,),
+        "maximum": (4,),
+      },
+    }
+
+    def distributionVersion(distribution_name):
+      try:
+        version_text = importlib.metadata.version(distribution_name)
+      except importlib.metadata.PackageNotFoundError:
+        return None
+      # Accept stable, post, and local releases. Reject prereleases because
+      # they do not satisfy pip's stable >= floor without an explicit opt-in.
+      return stable_distribution_release(version_text)
+
+    def distributionInstalled(distribution_name):
+      try:
+        importlib.metadata.version(distribution_name)
+        return True
+      except importlib.metadata.PackageNotFoundError:
+        return False
+
+    def hasCompatibleDistribution(distribution_name):
+      requirement = required[distribution_name]
+      version = distributionVersion(distribution_name)
+      return bool(
+        version is not None
+        and requirement["minimum"] <= version < requirement["maximum"]
+      )
 
     def hasPoseRealDataAPI():
-        try:
-            biocpd_module = importlib.import_module("biocpd")
-            initializer = getattr(biocpd_module, "pose_marginalized_initialization")
-            parameters = inspect.signature(initializer).parameters
-            return all(name in parameters for name in (
-                "coarse_screen_iterations", "coarse_survivor_count",
-                "coarse_score_mode", "refine_source_count", "n_jobs",
-            ))
-        except Exception:
-            return False
+      if not hasCompatibleDistribution("rustcpd"):
+        return False
+      try:
+        rustcpd_module = importlib.import_module("rustcpd")
+        initializer = getattr(rustcpd_module, "pose_marginalized_initialization")
+        parameters = inspect.signature(initializer).parameters
+        return all(name in parameters for name in (
+          "coarse_screen_iterations", "coarse_survivor_count",
+          "coarse_score_mode", "refine_source_count", "n_jobs",
+        ))
+      except Exception:
+        return False
 
-    missing=[]
-    for module_name, _ in required:
-        if importlib.util.find_spec(module_name) is None:
-            missing.append(module_name)
-        elif module_name == "biocpd" and not hasPoseRealDataAPI():
-            missing.append(module_name)
+    legacy_tiny3d_installed = distributionInstalled("tiny3d")
+    missing = [
+      name for name in required
+      if not hasCompatibleDistribution(name)
+    ]
+    if not hasPoseRealDataAPI() and "rustcpd" not in missing:
+      missing.append("rustcpd")
+    if legacy_tiny3d_installed and "tiny3d-rs" not in missing:
+      # Both distributions own the same tiny3d import package. Reinstall the
+      # Rust distribution after removing the legacy wheel so shared files are
+      # not left missing.
+      missing.append("tiny3d-rs")
+
+    loaded_replacements = [
+      required[name]["module"] for name in missing
+      if any(
+        module_name == required[name]["module"]
+        or module_name.startswith(required[name]["module"] + ".")
+        for module_name in sys.modules
+      )
+    ]
+    if loaded_replacements:
+      slicer.util.infoDisplay(
+        "Landmark Transfer must replace an already loaded native backend "
+        f"({', '.join(loaded_replacements)}). Restart Slicer, then reopen "
+        "Landmark Transfer to install the Rust backend safely. No packages "
+        "were changed."
+      )
+      return
+
     if missing:
-        labels=[spec for name,spec in required if name in missing]
-        msg="Landmark Transfer needs or must upgrade: "+", ".join(labels)+".\nInstall now?"
-        if not slicer.util.confirmOkCancelDisplay(msg):
-            slicer.util.errorDisplay("Dependencies not installed; some actions may fail."); return
-    self._deps_ready=False
-    try:
-        if missing:
-            specs=[spec for module_name,spec in required if module_name in missing]
-            slicer.util.pip_install(["--upgrade", *specs])
-            if "biocpd" in missing:
-                for module_name in [name for name in sys.modules if name == "biocpd" or name.startswith("biocpd.")]:
-                    sys.modules.pop(module_name, None)
-                importlib.invalidate_caches()
-        for module_name in ("tiny3d","biocpd","scipy.spatial","scipy.optimize"):
-            importlib.import_module(module_name)
-        if not hasPoseRealDataAPI():
-            raise RuntimeError(
-                "The installed biocpd>=1.3 wheel does not provide the required Pose-EM API."
-            )
-    except Exception as error:
-        slicer.util.errorDisplay(f"Landmark Transfer dependency installation failed:\n{error}\n{traceback.format_exc()}")
+      labels = [required[name]["spec"] for name in missing]
+      msg = "Landmark Transfer needs or must upgrade: " + ", ".join(labels) + "."
+      if legacy_tiny3d_installed:
+        msg += "\nThe legacy tiny3d distribution must be removed before tiny3d-rs is installed."
+      msg += "\nInstall now?"
+      if not slicer.util.confirmOkCancelDisplay(msg):
+        slicer.util.errorDisplay("Dependencies not installed; some actions may fail.")
         return
-    self._deps_ready=True
+
+    self._deps_ready = False
+    try:
+      if legacy_tiny3d_installed:
+        pip_uninstall = getattr(slicer.util, "pip_uninstall", None)
+        if pip_uninstall is None:
+          raise RuntimeError(
+            "This Slicer build cannot remove the legacy tiny3d distribution. "
+            "Uninstall tiny3d manually, restart Slicer, and reopen Landmark Transfer."
+          )
+        pip_uninstall("tiny3d")
+
+      if missing:
+        for package_name in [required[name]["module"] for name in missing]:
+          for module_name in [
+            name for name in sys.modules
+            if name == package_name or name.startswith(package_name + ".")
+          ]:
+            sys.modules.pop(module_name, None)
+        importlib.invalidate_caches()
+        specs = [required[name]["spec"] for name in missing]
+        install_args = ["--upgrade"]
+        if legacy_tiny3d_installed:
+          install_args.append("--force-reinstall")
+        slicer.util.pip_install([*install_args, *specs])
+        importlib.invalidate_caches()
+
+      for module_name in ("tiny3d", "rustcpd", "scipy.spatial", "scipy.optimize"):
+        importlib.import_module(module_name)
+      if not hasCompatibleDistribution("tiny3d-rs"):
+        raise RuntimeError("A compatible tiny3d-rs>=2.1,<3 distribution is not installed.")
+      if not hasPoseRealDataAPI():
+        raise RuntimeError(
+          "The installed rustcpd>=3.0,<4 wheel does not provide the required Pose-EM API."
+        )
+    except Exception as error:
+      slicer.util.errorDisplay(f"Landmark Transfer dependency installation failed:\n{error}\n{traceback.format_exc()}")
+      return
+    self._deps_ready = True
     slicer.util.showStatusMessage("Landmark Transfer: dependencies ready", 3000)
 
 
@@ -474,7 +570,7 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
 
     self.poseOptimizationBox=ctk.ctkCollapsibleButton(); self.poseOptimizationBox.text="Experimental pose-EM settings"; self.poseOptimizationBox.collapsed=True
     poseOptL=qt.QFormLayout(self.poseOptimizationBox); optL.addRow(self.poseOptimizationBox)
-    poseHelp=qt.QLabel("The defaults below match biocpd's real-data registration configuration: trajectory scoring, all coarse poses retained, and full-source refinement. Only the selected SSM shape is applied to the template; standard scaling, rigid alignment, and deformable registration still run afterward.")
+    poseHelp=qt.QLabel("The defaults below match rustcpd's real-data registration configuration: trajectory scoring, all coarse poses retained, and full-source refinement. Only the selected SSM shape is applied to the template; standard scaling, rigid alignment, and deformable registration still run afterward.")
     poseHelp.setWordWrap(True); poseOptL.addRow(poseHelp)
     self.poseRotationCount=qt.QSpinBox(); self.poseRotationCount.minimum=12; self.poseRotationCount.maximum=2048; self.poseRotationCount.value=193; self.poseRotationCount.setToolTip("Exact total hypothesis budget, including the identity and global/local rotation samples."); poseOptL.addRow("Total pose hypotheses:", self.poseRotationCount)
     self.poseCoarseSourceCount=qt.QSpinBox(); self.poseCoarseSourceCount.minimum=20; self.poseCoarseSourceCount.maximum=10000; self.poseCoarseSourceCount.value=400; poseOptL.addRow("Coarse source points:", self.poseCoarseSourceCount)
@@ -492,7 +588,7 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
     self.poseOutlierWeight=qt.QDoubleSpinBox(); self.poseOutlierWeight.minimum=0.0; self.poseOutlierWeight.maximum=0.99; self.poseOutlierWeight.singleStep=0.01; self.poseOutlierWeight.decimals=2; self.poseOutlierWeight.value=0.05; self.poseOutlierWeight.setToolTip("Pose-initializer outlier weight; independent of downstream PCA-CPD settings."); poseOptL.addRow("Pose outlier weight:", self.poseOutlierWeight)
     self.poseIdentityPrior=qt.QDoubleSpinBox(); self.poseIdentityPrior.minimum=0.01; self.poseIdentityPrior.maximum=0.99; self.poseIdentityPrior.singleStep=0.05; self.poseIdentityPrior.decimals=2; self.poseIdentityPrior.value=0.20; poseOptL.addRow("Identity-pose prior:", self.poseIdentityPrior)
     self.poseSeed=qt.QSpinBox(); self.poseSeed.minimum=0; self.poseSeed.maximum=2147483647; self.poseSeed.value=0; poseOptL.addRow("Deterministic seed:", self.poseSeed)
-    self.poseNJobs=qt.QSpinBox(); self.poseNJobs.minimum=1; self.poseNJobs.maximum=128; self.poseNJobs.value=4; self.poseNJobs.setToolTip("Parallel pose hypotheses. Landmark Transfer uses sequential BLAS locally when supported; unsupported native backends safely fall back to one worker."); poseOptL.addRow("Pose workers:", self.poseNJobs)
+    self.poseNJobs=qt.QSpinBox(); self.poseNJobs.minimum=1; self.poseNJobs.maximum=128; self.poseNJobs.value=4; self.poseNJobs.setToolTip("Use 1 for serial pose search; values above 1 enable rustcpd's deterministic internal parallel pool."); poseOptL.addRow("Pose workers:", self.poseNJobs)
     self.optimizeButton=qt.QPushButton("Run Template Optimization"); optL.addRow(self.optimizeButton)
 
     # --- Optimization Tab (append this) ---
@@ -1022,8 +1118,7 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
               f"score={info['score']:.3f}, margin={info['score_margin']:.3f}, "
               f"effective poses={info['effective_hypotheses']:.2f}, "
               f"evaluated/refined={info['hypotheses_evaluated']}/{info['hypotheses_refined']}, "
-              f"workers={info['pose_workers_effective']}, "
-              f"BLAS limited={info['blas_threads_limited']})."
+              f"parallel={'yes' if info['pose_workers_effective'] != 1 else 'no'})."
           )
           if info["effective_hypotheses"] >= 2.0:
               self._log_opt(
@@ -1468,8 +1563,7 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
           raise RuntimeError(f"Failed to save warped mesh: {outputPath}")
 
   def runDeformable(self, tableNode, sourceLM, scale, targetSLM, parameters, rigidMatrix=None, ssmData=None):
-      from biocpd.atlas_registration import AtlasRegistration
-      from biocpd.deformable_registration import DeformableRegistration
+      import rustcpd
       if tableNode is None: raise ValueError("runDeformable requires tableNode to be set")
 
       # Keep SSM geometry consistent with the (already scaled) sourceLM
@@ -1515,39 +1609,43 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
 
       cov = float(parameters.get("targetCoverage", 1.0))
       is_complete = abs(cov - 1.0) < 1e-6   # or: np.isclose(cov, 1.0)
+      sparse_k = max(1, min(10, len(tgt_n)))
 
-      pca = AtlasRegistration(
-          X=np.asarray(tgt_n),          # scaled target
-          Y=np.asarray(src_n),            # mean_shape=None ⇒ Y is the base
-          mean_shape=None,
-          U=U_aligned,
-          eigenvalues=eigvals_eff,          # no external scaling/flooring
-          lambda_reg=float(parameters.get("lambda_reg", 0.4)),  # no scale² here
-          alpha=float(parameters.get("alpha", 2.0)),
-          w=float(parameters.get("w", 0.2)),
+      pca = rustcpd.register_atlas(
+          np.asarray(tgt_n),             # scaled target
+          np.asarray(src_n),             # source is the SSM base
+          U_aligned,
+          eigvals_eff,                   # no external scaling/flooring
+          lambda_regularization=float(parameters.get("lambda_reg", 0.4)),  # no scale² here
+          outlier_weight=float(parameters.get("w", 0.2)),
           tolerance=float(parameters.get("tolerance", 1e-6)),
           max_iterations=int(parameters.get("max_iterations", 120)),
           with_scale=is_complete,
-          normalize=True                    # << key change
+          normalize=True,
+          optimize_similarity=True,
+          k=sparse_k,
+          kdtree_radius_scale=10.0,
       )
-      warped_landmarks, _ = pca.register()
+      warped_landmarks = np.asarray(pca.points)
 
       if bool(parameters.get("skipFineCPD", False)):
         return warped_landmarks / s20
 
-      final = DeformableRegistration(
-          X=np.asarray(tgt_n),
-          Y=warped_landmarks,
+      final = rustcpd.register_deformable(
+          np.asarray(tgt_n),
+          warped_landmarks,
           beta=float(parameters.get("beta", 2.0)),
           alpha=float(parameters.get("alpha", 2.0)),
+          low_rank=max(1, min(300, len(warped_landmarks))),
           tolerance=float(parameters.get("tolerance", 1e-6)),
           max_iterations=int(parameters.get("max_iterations", 120)),
+          k=sparse_k,
       )
-      warped_landmarks, _ = final.register()
+      warped_landmarks = np.asarray(final.points)
       return warped_landmarks/s20
 
   def runFineDeformable(self, sourceLM, targetSLM, parameters):
-      from biocpd.deformable_registration import DeformableRegistration
+      import rustcpd
       source = np.asarray(sourceLM, dtype=float)
       target = np.asarray(targetSLM, dtype=float)
       if bool(parameters.get("skipFineCPD", False)):
@@ -1556,16 +1654,17 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
           raise ValueError("Fine CPD requires source and target arrays with shape (N, 3).")
       diag = float(np.linalg.norm(np.ptp(target, axis=0))) if len(target) else 0.0
       scale = 20.0 / max(diag, 1e-12)
-      final = DeformableRegistration(
-          X=target * scale,
-          Y=source * scale,
+      final = rustcpd.register_deformable(
+          target * scale,
+          source * scale,
           beta=float(parameters.get("beta", 2.0)),
           alpha=float(parameters.get("alpha", 2.0)),
+          low_rank=max(1, min(300, len(source))),
           tolerance=float(parameters.get("tolerance", 1e-6)),
           max_iterations=int(parameters.get("max_iterations", 120)),
+          k=max(1, min(10, len(target))),
       )
-      warped, _ = final.register()
-      return warped / scale
+      return np.asarray(final.points) / scale
 
   def _triangulate_polydata(self, pd):
     tf = vtk.vtkTriangleFilter()

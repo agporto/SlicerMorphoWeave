@@ -32,7 +32,7 @@ MorphoWeave retains its existing lightweight scripted-module tests. Before submi
 2. Install the generated package into a clean Slicer profile.
 3. Restart Slicer and open Atlas Builder, Model Library, Landmark Transfer, and Surface Segmentation.
 4. Confirm that module icons and packaged Python resources load.
-5. Confirm that Landmark Transfer offers installation of `tiny3d` and a compatible `biocpd` release when they are absent.
+5. Confirm that Landmark Transfer offers installation of compatible `tiny3d-rs` and `rustcpd` releases when they are absent, and that replacing a loaded legacy `tiny3d` installation requests a Slicer restart.
 
 No SlicerMorph dependency or bundled test dataset is required for the initial Tier 1 submission.
 

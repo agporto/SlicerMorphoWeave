@@ -119,10 +119,12 @@ Across all modules, compact text states such as **Needs input**, **Ready**, **Op
 
 MorphoWeave uses Slicer-provided Python, VTK, NumPy, and SciPy. Landmark Transfer additionally requires:
 
-- [`tiny3d`](https://pypi.org/project/tiny3d/) for point-cloud processing and rigid registration; and
-- [`biocpd>=1.3`](https://pypi.org/project/biocpd/) for shape-model-guided deformable registration and pose initialization.
+- [`tiny3d-rs>=2.1,<3`](https://pypi.org/project/tiny3d-rs/) for point-cloud processing and rigid registration (installed as `tiny3d-rs`, imported as `tiny3d`); and
+- [`rustcpd>=3.0,<4`](https://pypi.org/project/rustcpd/) for shape-model-guided deformable registration and pose initialization.
 
-When these packages are missing or incompatible, Landmark Transfer asks for permission before installing or upgrading them through Slicer's Python environment. An internet connection is therefore required the first time those dependencies are installed.
+When these packages are missing or incompatible, Landmark Transfer asks for permission before installing or upgrading them through Slicer's Python environment. The legacy C++ `tiny3d` distribution and `tiny3d-rs` cannot coexist because they provide the same import package. Landmark Transfer requests a restart before replacing any loaded native backend; after restart, it removes the legacy distribution and installs the Rust replacement. An internet connection is therefore required the first time those dependencies are installed.
+
+`tiny3d-rs` intentionally fixes nondeterministic normal orientation and ineffective mutual feature filtering in the C++ backend. MorphoWeave keeps the same registration flow and parameters, but rigid-registration results may differ numerically from runs made with the legacy package.
 
 The Pose-marginalized EM backend is optional. The established FPFH + RANSAC template optimizer remains the default.
 
@@ -176,7 +178,7 @@ Porto, A. MorphoWeave: Atlas-based 3D landmark transfer and statistical shape mo
 https://github.com/agporto/SlicerMorphoWeave
 ```
 
-When using Atlas Builder, also cite the relevant SlicerDenseCorrespondenceAnalysis/DeCA software and publication. Please additionally cite the methods and software used by the relevant workflow, including 3D Slicer, SlicerMorph when used, and the `biocpd` or `tiny3d` documentation as appropriate.
+When using Atlas Builder, also cite the relevant SlicerDenseCorrespondenceAnalysis/DeCA software and publication. Please additionally cite the methods and software used by the relevant workflow, including 3D Slicer, SlicerMorph when used, and the `rustcpd` or `tiny3d-rs` documentation as appropriate.
 
 ## License
 
