@@ -149,7 +149,7 @@ For errors, open **View > Error Log** in Slicer and include the relevant traceba
 | Issue | Likely cause | Suggested action |
 |---|---|---|
 | Landmark count mismatch in Atlas Builder | Input landmark files contain inconsistent numbers of points | Standardize landmark counts and regenerate the affected files |
-| Subsampling produces no points | Point density is too low or model scales differ substantially | Increase **Point Density** or enable scaling |
+| Subsampling produces no points | The requested registration count is too low or model scales differ substantially | Increase **Target registration points** or enable scaling |
 | Poor RANSAC alignment | Feature radii or distance threshold are too restrictive | Increase the normal/FPFH radii or RANSAC distance threshold |
 | PCA-CPD stops early | The loaded SSM does not match the template correspondence count | Rebuild or reload the matching database |
 | Projection overshoots the surface | Projection distance is too large | Reduce the maximum projection factor |

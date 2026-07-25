@@ -20,7 +20,7 @@ def _load_source_function(name):
         node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == name
     )
-    namespace = {"re": re}
+    namespace = {"re": re, "np": np}
     exec(
         compile(
             ast.Module(body=[function], type_ignores=[]),
@@ -33,6 +33,7 @@ def _load_source_function(name):
 
 
 stable_distribution_release = _load_source_function("stable_distribution_release")
+target_count_voxel_size = _load_source_function("target_count_voxel_size")
 
 
 from Resources.Python.PoseEMTemplate import (
@@ -108,6 +109,9 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
         self.assertIn('parameters.get("lambda_reg", 0.01)', source)
         self.assertIn('parameters.get("w", 0.10)', source)
         self.assertIn('parameters.get("max_iterations", 250)', source)
+        self.assertIn('"key":"registrationPointCount"', source)
+        self.assertIn('"value":2000', source)
+        self.assertNotIn('"key":"pointDensity"', source)
         self.assertNotIn("from biocpd", source)
         self.assertNotIn("from packaging", source)
         self.assertIn("slicer.util.pip_install", source)
@@ -120,6 +124,34 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
         self.assertEqual(stable_distribution_release("3.0+cpu"), (3, 0))
         self.assertIsNone(stable_distribution_release("3.0.0rc1"))
         self.assertIsNone(stable_distribution_release("2.1.0.dev2"))
+
+    def test_registration_voxel_size_targets_irregular_cloud_count(self):
+        rng = np.random.default_rng(31)
+        points = rng.normal(size=(8000, 3)) * np.array([4.0, 1.4, 0.3])
+        points[:, 2] += 0.05 * points[:, 0] ** 2
+        voxel_size = target_count_voxel_size(points, 600)
+        origin = points.min(axis=0)
+        keys = np.floor((points - origin) / voxel_size).astype(np.int64)
+        count = len(np.unique(keys, axis=0))
+        self.assertLessEqual(abs(count - 600), 12)
+
+    def test_registration_target_count_drives_pose_and_shared_rigid_resolution(self):
+        source = (MODULE_DIR / "MorphoWeaveLandmarkTransfer.py").read_text(encoding="utf-8")
+        pose_prep = source.split("  def _pose_em_target_points(", 1)[1].split(
+            "  def runPoseEMDeformable", 1
+        )[0]
+        rigid = source.split("  def runSubsample(", 1)[1].split(
+            "  def propagateLandmarkTypes", 1
+        )[0]
+        legacy_optimizer = source.split("  def initialize_template(", 1)[1]
+
+        self.assertIn("target_count_voxel_size(", pose_prep)
+        self.assertIn('parameters.get("pointDensity", 1.3)', pose_prep)
+        self.assertIn("source_voxel_size = voxel_size", rigid)
+        self.assertIn("target_count_voxel_size(", rigid)
+        self.assertIn('parameters.get("pointDensity", 1.3)', rigid)
+        self.assertIn("target_count_voxel_size(", legacy_optimizer)
+        self.assertIn('parameters.get("pointDensity", 1.0)', legacy_optimizer)
 
     def test_pose_em_never_bypasses_standard_alignment_stages(self):
         source = (MODULE_DIR / "MorphoWeaveLandmarkTransfer.py").read_text(encoding="utf-8")

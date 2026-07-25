@@ -13,6 +13,93 @@ from scipy.sparse import coo_matrix, diags, eye as speye
 from scipy.sparse.linalg import splu
 
 
+def voxel_representative_indices(points, voxel_size, origin):
+  points = np.asarray(points, dtype=np.float64)
+  if len(points) == 0:
+    return np.empty((0,), dtype=np.int64)
+  if not np.isfinite(voxel_size) or voxel_size <= 0:
+    raise ValueError("voxel_size must be positive and finite")
+  keys = np.floor((points - np.asarray(origin, dtype=np.float64)) / voxel_size).astype(np.int64)
+  original = np.arange(len(points), dtype=np.int64)
+  order = np.lexsort((original, keys[:, 2], keys[:, 1], keys[:, 0]))
+  sorted_keys = keys[order]
+  first = np.ones(len(order), dtype=bool)
+  first[1:] = np.any(sorted_keys[1:] != sorted_keys[:-1], axis=1)
+  return np.sort(order[first]).astype(np.int64, copy=False)
+
+
+def farthest_point_subset_indices(points, candidate_indices, target_count):
+  points = np.asarray(points, dtype=np.float64)
+  candidates = np.unique(np.asarray(candidate_indices, dtype=np.int64))
+  target_count = int(target_count)
+  if target_count <= 0:
+    raise ValueError("target_count must be positive")
+  if len(candidates) <= target_count:
+    return np.sort(candidates)
+
+  candidate_points = points[candidates]
+  centroid = candidate_points.mean(axis=0)
+  first = int(np.argmax(np.sum((candidate_points - centroid) ** 2, axis=1)))
+  selected = np.zeros(len(candidates), dtype=bool)
+  selected[first] = True
+  chosen = [first]
+  nearest = np.sum((candidate_points - candidate_points[first]) ** 2, axis=1)
+
+  while len(chosen) < target_count:
+    nearest[selected] = -1.0
+    next_index = int(np.argmax(nearest))
+    selected[next_index] = True
+    chosen.append(next_index)
+    distance = np.sum((candidate_points - candidate_points[next_index]) ** 2, axis=1)
+    nearest = np.minimum(nearest, distance)
+
+  return np.sort(candidates[np.asarray(chosen, dtype=np.int64)])
+
+
+def sample_indices_voxel_target_points(points, target_count=2000, tolerance=0.02, max_iterations=40):
+  points = np.asarray(points, dtype=np.float64)
+  if points.ndim != 2 or points.shape[1] != 3:
+    raise ValueError("points must have shape (N, 3)")
+  if not np.all(np.isfinite(points)):
+    raise ValueError("points must contain only finite coordinates")
+  target_count = int(target_count)
+  if target_count <= 0:
+    raise ValueError("target_count must be positive")
+  if len(points) <= target_count:
+    return np.arange(len(points), dtype=np.int64)
+
+  bounds_min = points.min(axis=0)
+  diagonal = float(np.linalg.norm(points.max(axis=0) - bounds_min))
+  if diagonal <= np.finfo(np.float64).eps:
+    return np.arange(target_count, dtype=np.int64)
+
+  low = diagonal * 1e-9
+  high = diagonal
+  best_indices = np.arange(len(points), dtype=np.int64)
+  best_overshoot = len(points) - target_count
+  tolerance_count = max(1, int(round(target_count * float(tolerance))))
+
+  for _ in range(max(1, int(max_iterations))):
+    voxel_size = float(np.sqrt(low * high))
+    indices = voxel_representative_indices(points, voxel_size, bounds_min)
+    count = len(indices)
+
+    if target_count <= count and count - target_count < best_overshoot:
+      best_indices = indices
+      best_overshoot = count - target_count
+      if best_overshoot <= tolerance_count:
+        break
+
+    if count > target_count:
+      low = voxel_size
+    elif count < target_count:
+      high = voxel_size
+    else:
+      return indices
+
+  return farthest_point_subset_indices(points, best_indices, target_count)
+
+
 def setWorkflowStatus(label, state, detail):
   title, color = {
     "needs_input": ("Needs input", "#c75b5b"),
@@ -126,18 +213,18 @@ class MorphoWeaveAtlasBuilderWidget(ScriptedLoadableModuleWidget):
     hwarp = qt.QHBoxLayout(); hwarp.addWidget(self.warpMethod); hwarp.addWidget(self.autoFallback)
     advLay.addRow("Warp method:", hwarp)
 
-    # Sampling slider + preview
-    self.spacing = ctk.ctkSliderWidget(); self.spacing.singleStep = .1; self.spacing.minimum = 0; self.spacing.maximum = 10; self.spacing.value = 4
-    self.spacing.setToolTip("Sampling radius as % of bounding-box diagonal. Larger radius → fewer exported points.")
-    advLay.addRow("Sampling radius (% of diag):", self.spacing)
+    # Target-count sampling + preview
+    self.targetPointCount = qt.QSpinBox(); self.targetPointCount.minimum = 100; self.targetPointCount.maximum = 1_000_000; self.targetPointCount.singleStep = 100; self.targetPointCount.value = 2000
+    self.targetPointCount.setToolTip("Requested number of existing atlas vertices to export. If the atlas has fewer vertices, all are used.")
+    advLay.addRow("Target dense points:", self.targetPointCount)
 
     self.previewBtn = qt.QPushButton("Preview Point Count"); self.previewBtn.enabled = False
     self.previewLbl = qt.QLabel("")
     h = qt.QHBoxLayout(); h.addWidget(self.previewBtn); h.addWidget(self.previewLbl, 1)
-    advLay.addRow("Expected points:", h)
+    advLay.addRow("Selected points:", h)
     self._previewTimer = qt.QTimer(); self._previewTimer.setSingleShot(True); self._previewTimer.setInterval(250)
     self._previewTimer.timeout.connect(self._onPreview)
-    self.spacing.valueChanged.connect(lambda v: self._previewTimer.start())
+    self.targetPointCount.valueChanged.connect(lambda v: self._previewTimer.start())
 
     runBox = ctk.ctkCollapsibleButton(); runBox.text = "Run + Status"; runBox.collapsed = False
     runLay = qt.QFormLayout(runBox); lay.addRow(runBox)
@@ -264,8 +351,10 @@ class MorphoWeaveAtlasBuilderWidget(ScriptedLoadableModuleWidget):
     pd = self._getPreviewPolyData()
     if pd: self.logic.maybeWarnDense(pd, label="preview")
     if not pd: self.previewLbl.setText("n/a"); return
-    n, tot = self.logic.previewCountForRadius(pd, self.spacing.value)
-    self.previewLbl.setText(f"{n} of {tot} (~{(100.0*n/max(1,tot)):.1f}%)")
+    target = int(self.targetPointCount.value)
+    n, tot = self.logic.previewCountForTarget(pd, target)
+    suffix = " (all available)" if tot < target else ""
+    self.previewLbl.setText(f"{n} of {tot} (~{(100.0*n/max(1,tot)):.1f}%){suffix}")
 
   def _loadAtlas(self):
     try:
@@ -353,7 +442,7 @@ class MorphoWeaveAtlasBuilderWidget(ScriptedLoadableModuleWidget):
           atlasModel, atlasLMs,
           F['alignedModels'], F['alignedLMs'],
           F['population_correspondences'], F['atlas'],
-          self.spacing.value,
+          int(self.targetPointCount.value),
           warp_method=method,
           allow_fallback=allowFallback,
           progress=lambda msg: self._status(msg)
@@ -924,90 +1013,28 @@ class MorphoWeaveAtlasBuilderLogic(ScriptedLoadableModuleLogic):
       try: slicer.app.setRenderPaused(False)
       except Exception: pass
 
-  # -------- Dense export (method-selectable) --------
   def _bbox_diag(self, pd):
-    b = pd.GetBounds()
-    return float(np.linalg.norm([b[1]-b[0], b[3]-b[2], b[5]-b[4]]))
+    bounds = pd.GetBounds()
+    return float(np.linalg.norm([
+      bounds[1] - bounds[0],
+      bounds[3] - bounds[2],
+      bounds[5] - bounds[4],
+    ]))
 
-  def sample_indices_poisson(self, pd, frac):
-    tri = vtk.vtkTriangleFilter()
-    tri.SetInputData(pd)
-    tri.PassLinesOff()
-    tri.PassVertsOff()
-    tri.Update()
-    tri_pd = tri.GetOutput()
+  # -------- Dense export (method-selectable) --------
+  def sample_indices_voxel_target(self, pd, target_count=2000, tolerance=0.02):
+    if pd is None or pd.GetPoints() is None:
+      return np.empty((0,), dtype=np.int64)
+    points = vtk_np.vtk_to_numpy(pd.GetPoints().GetData()).astype(np.float64, copy=False)
+    return sample_indices_voxel_target_points(
+      points,
+      target_count=target_count,
+      tolerance=tolerance,
+    )
 
-    try:
-      ids_name = "origIds"
-
-      if hasattr(vtk, "vtkGenerateIds"):
-        gen = vtk.vtkGenerateIds()
-        if hasattr(gen, "PointIdsOn"): gen.PointIdsOn()
-        if hasattr(gen, "CellIdsOff"): gen.CellIdsOff()
-        if hasattr(gen, "SetPointIdsArrayName"): gen.SetPointIdsArrayName(ids_name)
-        elif hasattr(gen, "SetIdsArrayName"): gen.SetIdsArrayName(ids_name)
-        gen.SetInputData(tri_pd)
-        gen.Update()
-        id_output = gen.GetOutputPort()
-
-      elif hasattr(vtk, "vtkIdFilter"):
-        idf = vtk.vtkIdFilter()
-        idf.PointIdsOn()
-        if hasattr(idf, "CellIdsOff"): idf.CellIdsOff()
-        idf.SetPointIdsArrayName(ids_name)
-        idf.SetInputData(tri_pd)
-        idf.Update()
-        id_output = idf.GetOutputPort()
-
-      else:
-        raise AttributeError("No VTK id-generation filter available")
-
-      if not hasattr(vtk, "vtkPoissonDiskSampler"):
-        raise AttributeError("vtkPoissonDiskSampler unavailable")
-
-      ps = vtk.vtkPoissonDiskSampler()
-      ps.SetRadius(max(1e-9, float(frac)) * self._bbox_diag(tri_pd))
-      ps.SetInputConnection(id_output)
-      ps.Update()
-
-      arr = ps.GetOutput().GetPointData().GetArray(ids_name)
-      if arr is not None:
-        return vtk_np.vtk_to_numpy(arr).astype(np.int64, copy=False)
-
-    except Exception:
-      pass
-
-    pts = vtk_np.vtk_to_numpy(tri_pd.GetPoints().GetData()).astype(np.float64, copy=False)
-    n = pts.shape[0]
-    if n == 0:
-      return np.empty((0,), np.int64)
-
-    r = max(1e-9, float(frac)) * self._bbox_diag(tri_pd)
-    kdt = cKDTree(pts)
-
-    remaining = np.ones(n, dtype=bool)
-    out = []
-
-    c = pts.mean(axis=0)
-    i0 = int(np.argmax(np.sum((pts - c)**2, axis=1)))
-    stack = [i0]
-
-    while stack:
-      i = stack.pop()
-      if not remaining[i]:
-        continue
-      out.append(i)
-      nbrs = kdt.query_ball_point(pts[i], r)
-      remaining[nbrs] = False
-      if remaining.any():
-        stack.append(int(np.flatnonzero(remaining)[0]))
-
-    out.sort()
-    return np.array(out, dtype=np.int64)
-
-  def previewCountForRadius(self, polyDataOrNode, spacingPct):
+  def previewCountForTarget(self, polyDataOrNode, targetCount):
     pd = polyDataOrNode if isinstance(polyDataOrNode, vtk.vtkPolyData) else polyDataOrNode.GetPolyData()
-    keep_idx = self.sample_indices_poisson(pd, float(spacingPct)/100.0)
+    keep_idx = self.sample_indices_voxel_target(pd, int(targetCount))
     return int(keep_idx.size), int(pd.GetNumberOfPoints())
 
   def _build_surface_locator(self, mesh_pd):
@@ -1068,7 +1095,7 @@ class MorphoWeaveAtlasBuilderLogic(ScriptedLoadableModuleLogic):
   def exportDenseLMs(self, atlasModelNode, atlasLMNode,
                      alignedModelsDir, alignedLMsDir,
                      denseDir, atlasDir,
-                     spacingTolerance,
+                     targetPointCount,
                      *, warp_method="tps", allow_fallback=True, progress=None):
     self._harden_if_parented(atlasModelNode)
     self._harden_if_parented(atlasLMNode)
@@ -1086,9 +1113,11 @@ class MorphoWeaveAtlasBuilderLogic(ScriptedLoadableModuleLogic):
       try: slicer.app.setRenderPaused(True)
       except Exception: pass
 
-      spacingFrac = float(spacingTolerance) / 100.0
-      keep_idx = self.sample_indices_poisson(atlasModelNode.GetPolyData(), spacingFrac)
-      if keep_idx.size == 0: raise ValueError("Sampling radius produced 0 template points. Reduce the radius and try again.")
+      keep_idx = self.sample_indices_voxel_target(
+        atlasModelNode.GetPolyData(),
+        int(targetPointCount),
+      )
+      if keep_idx.size == 0: raise ValueError("Target sampling produced 0 template points.")
 
       names, models, _, lms = self.importPaired(alignedModelsDir, alignedLMsDir, normals=False)
       if len(names) == 0: raise ValueError("No paired aligned models/landmarks found to export.")

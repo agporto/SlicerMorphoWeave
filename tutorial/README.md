@@ -81,8 +81,8 @@ Optionally expand `Optional Model Library Save`, enable `Save SSM to Model Libra
 * **Keep aligned models and landmarks**: Defaults to True. Retains transformed derivatives in alignedModels/* and alignedLMs/*. Disable it to use a temporary processing workspace and omit these folders from the final output.
 * **Warp method**: Defaults to TPS (recommended). Warp using thin plate splines (TPS; more smooth and flexible) or biharmonic (more rigid).
   * * **Auto-fallback to TPS if biharmonic fails**: Defaults to True.
-* **Sampling radius (% of diag)**: Choose a value that will produce 2000 - 4000 expected dense correspondence points.
-* **Expected points**: Adjust `Sampling radius` and click `Preview Point Count` until desired count is achieved.
+* **Target dense points**: Requested number of existing atlas vertices used for dense correspondences. The default is 2,000; if the atlas has fewer vertices, all available vertices are used.
+* **Selected points**: Click `Preview Point Count` to confirm the resulting count before running the pipeline.
 
 <p align="center">
 <img src="images/6.png" width = 600>
@@ -182,7 +182,7 @@ Workflow labels use compact **Needs input**, **Ready**, **Optional**, and **Comp
 </p>
 
 1) Subsample source/target.
-Downsample source and target point clouds based on value set in Advanced ⟶ Point density and max projection ⟶ Point Density.
+Downsample the target toward the count set in Advanced ⟶ Point sampling and max projection ⟶ Target registration points. The solved target voxel resolution is also applied to the source.
 
 <p align="center">
 <img src="images/15.png" width = 600>
@@ -263,8 +263,8 @@ Pose-EM settings use MorphoWeave's rustcpd configuration: an exact budget of 193
 * **Skip template optimization (batch)**: Uses same template for all targets (faster)
 * **Target completeness (linear fraction)**: Fraction of specimen intact (0.5 = 50% complete)
 
-`Point density and max projection`
-* **Point Density**: Higher = more points, slower. Default 1.3
+`Point sampling and max projection`
+* **Target registration points**: Requested size of temporary registration clouds. Default 2,000. The target determines the voxel resolution used for both target and source; values below 1,600 limit Pose-EM refinement.
 * **Max projection factor (%)**: Max distance landmarks move to surface (% of size)
 
 `Rigid registration`

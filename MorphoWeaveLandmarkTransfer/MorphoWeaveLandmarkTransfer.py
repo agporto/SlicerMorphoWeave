@@ -25,6 +25,46 @@ def stable_distribution_release(version_text):
   )
   return tuple(int(part) for part in match.group(1).split(".")) if match else None
 
+def target_count_voxel_size(points, target_count, tolerance=0.02, max_iterations=40):
+  points = np.asarray(points, dtype=np.float64)
+  if points.ndim != 2 or points.shape[1] != 3 or len(points) == 0:
+    raise ValueError("points must be a non-empty array with shape (N, 3)")
+  if not np.all(np.isfinite(points)):
+    raise ValueError("points must contain only finite coordinates")
+  target_count = int(target_count)
+  if target_count <= 0:
+    raise ValueError("target_count must be positive")
+
+  origin = points.min(axis=0)
+  diagonal = float(np.linalg.norm(points.max(axis=0) - origin))
+  if diagonal <= np.finfo(np.float64).eps:
+    return float(np.finfo(np.float64).eps)
+
+  low = diagonal * 1e-9
+  high = diagonal
+  best_size = low
+  best_error = abs(len(points) - target_count)
+  tolerance_count = max(1, int(round(target_count * float(tolerance))))
+
+  for _ in range(max(1, int(max_iterations))):
+    voxel_size = float(np.sqrt(low * high))
+    keys = np.floor((points - origin) / voxel_size).astype(np.int64)
+    count = int(np.unique(keys, axis=0).shape[0])
+    error = abs(count - target_count)
+    if error < best_error:
+      best_error = error
+      best_size = voxel_size
+      if best_error <= tolerance_count:
+        break
+    if count > target_count:
+      low = voxel_size
+    elif count < target_count:
+      high = voxel_size
+    else:
+      return voxel_size
+
+  return best_size
+
 def setWorkflowStatus(label, state, detail):
   title, color = {
     "needs_input": ("Needs input", "#c75b5b"),
@@ -332,8 +372,9 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
     {"key":"skipProjection","kind":"check","label":"Skip projection","section":"General Settings","value":False},
     {"key":"skipOptimization","kind":"check","label":"Skip template optimization (batch)","section":"General Settings","value":False},
     {"key":"targetCoverage","kind":"dspin","label":"Target completeness (linear fraction)","section":"General Settings", "min":0.05,"max":1.0,"step":0.01,"value":1.0,"decimals":2},
-    {"key":"pointDensity","kind":"slider","label":"Point Density","section":"Point density and max projection","min":0.1,"max":3.0,"step":0.1,"value":1.3},
-    {"key":"projectionFactor","kind":"slider","label":"Max projection factor (%)","section":"Point density and max projection","min":0,"max":10,"step":0.1,"value":1.0},
+    {"key":"registrationPointCount","kind":"spin","label":"Target registration points","section":"Point sampling and max projection","min":100,"max":1_000_000,"step":100,"value":2000,
+     "tooltip":"Target size for temporary registration clouds. Values below 1,600 limit Pose-EM refinement."},
+    {"key":"projectionFactor","kind":"slider","label":"Max projection factor (%)","section":"Point sampling and max projection","min":0,"max":10,"step":0.1,"value":1.0},
     {"key":"normalSearchRadius","kind":"slider","label":"Normal search radius","section":"Rigid registration","min":2,"max":12,"step":1,"value":2},
     {"key":"FPFHSearchRadius","kind":"slider","label":"FPFH search radius","section":"Rigid registration","min":3,"max":20,"step":1,"value":5},
     {"key":"distanceThreshold","kind":"slider","label":"RANSAC distance threshold","section":"Rigid registration","min":0.5,"max":4.0,"step":0.25,"value":1.5},
@@ -387,6 +428,8 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
         w=ctk.ctkDoubleSpinBox(); w.minimum=float(p["min"]); w.maximum=float(p["max"]); w.singleStep=float(p["step"]); w.value=float(v); w.setDecimals(int(p.get("decimals",3))); w.valueChanged.connect(self._on_param_changed)
       else:
         continue
+      if p.get("tooltip"):
+        w.setToolTip(p["tooltip"])
       setattr(self, f"param_{key}", w)
       section(sec).addRow(lab+": ", w)
     self.parameterDictionary = self._read_params()
@@ -399,6 +442,7 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
       else: d[p['key']] = float(w.value) if hasattr(w,'value') else w.value()
     # integers for specific keys
     d["maxRANSAC"] = int(d["maxRANSAC"]); d["max_iterations"] = int(d["max_iterations"])
+    d["registrationPointCount"] = int(d["registrationPointCount"])
     d["normalSearchRadius"] = int(d["normalSearchRadius"]); d["FPFHSearchRadius"] = int(d["FPFHSearchRadius"])
     return d
 
@@ -1425,7 +1469,13 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
     if target.ndim != 2 or target.shape[1] != 3 or len(target) == 0:
       raise ValueError("Pose EM requires a non-empty target model.")
     diag = float(np.linalg.norm(np.ptp(target, axis=0)))
-    voxel = diag / (55.0 * max(float(parameters.get("pointDensity", 1.3)), 0.1))
+    if "registrationPointCount" in parameters:
+      voxel = target_count_voxel_size(
+        target,
+        int(parameters["registrationPointCount"]),
+      )
+    else:
+      voxel = diag / (55.0 * max(float(parameters.get("pointDensity", 1.3)), 0.1))
     if voxel <= np.finfo(float).eps:
       return target
     cloud = t3d.geometry.PointCloud(); cloud.points = t3d.utility.Vector3dVector(target)
@@ -2005,15 +2055,23 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
     if skipScaling:
       size = np.linalg.norm(target.get_max_bound() - target.get_min_bound())
       size_eff = size / cov
-      voxel_size = size_eff / (55 * parameters["pointDensity"])
+      voxel_size = size_eff / (55 * max(float(parameters.get("pointDensity", 1.3)), 0.1))
       source_center = np.zeros(3); target_center = np.zeros(3); source_scaling = target_scaling = 1.0
     else:
-      voxel_size = 1.0 / (55 * parameters["pointDensity"]) ; source_center = source.get_center(); target_center = target.get_center()
+      voxel_size = 1.0 / (55 * max(float(parameters.get("pointDensity", 1.3)), 0.1)); source_center = source.get_center(); target_center = target.get_center()
       tmp_src = copy.deepcopy(source).translate(-source_center); tmp_tgt = copy.deepcopy(target).translate(-target_center)
       sourceSize = np.linalg.norm(tmp_src.get_max_bound() - tmp_src.get_min_bound()); targetSize = np.linalg.norm(tmp_tgt.get_max_bound() - tmp_tgt.get_min_bound())
       source_scaling = 1.0 / sourceSize if sourceSize > 0 else 1.0; target_scaling = 1.0 / targetSize if targetSize > 0 else 1.0
       source.scale(source_scaling, center=source_center); target.scale(target_scaling, center=target_center)
-    source_down, source_fpfh = self.preprocess_point_cloud(source, voxel_size*cov, parameters["normalSearchRadius"], parameters["FPFHSearchRadius"])
+    if "registrationPointCount" in parameters:
+      voxel_size = target_count_voxel_size(
+        np.asarray(target.points, dtype=float),
+        int(parameters["registrationPointCount"]),
+      )
+      source_voxel_size = voxel_size
+    else:
+      source_voxel_size = voxel_size * cov
+    source_down, source_fpfh = self.preprocess_point_cloud(source, source_voxel_size, parameters["normalSearchRadius"], parameters["FPFHSearchRadius"])
     target_down, target_fpfh = self.preprocess_point_cloud(target, voxel_size, parameters["normalSearchRadius"], parameters["FPFHSearchRadius"])
     if not skipScaling:
       src_pts = np.asarray(source_down.points); tgt_pts = np.asarray(target_down.points)
@@ -2037,7 +2095,7 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
     t3d.utility.random.seed(int(42))
     pcd_down = pcd.voxel_down_sample(voxel_size)
     if len(pcd_down.points) == 0:
-      raise RuntimeError(f"Downsampling produced 0 points at voxel={voxel_size:.4f}. Increase point density or reduce voxel size.")
+      raise RuntimeError(f"Downsampling produced 0 points at voxel={voxel_size:.4f}. Increase target registration points or verify model scale.")
     radius_normal = voxel_size * radius_normal_factor
     pcd_down.estimate_normals(t3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30))
     radius_feature = voxel_size * radius_feature_factor
@@ -2174,7 +2232,13 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
       s0 = bbox_diag_np(mean) / (bbox_diag_np(tgt_np) + 1e-12)
       tgt_scaled = t3d.geometry.PointCloud(tgt_pcd); tgt_scaled.scale(s0, center=tgt_scaled.get_center())
       size_scaled = float(np.linalg.norm(tgt_scaled.get_max_bound() - tgt_scaled.get_min_bound()))
-      voxel_f = size_scaled / (25.0 * float(parameters.get("pointDensity", 1.0)))
+      if "registrationPointCount" in parameters:
+          voxel_f = target_count_voxel_size(
+              np.asarray(tgt_scaled.points, dtype=float),
+              int(parameters["registrationPointCount"]),
+          )
+      else:
+          voxel_f = size_scaled / (25.0 * float(parameters.get("pointDensity", 1.0)))
       voxel_c = voxel_f * 1.5
       rn = int(parameters.get("normalSearchRadius", 2)); rf = int(parameters.get("FPFHSearchRadius", 5))
       tgt_down_f, tgt_fpfh_f = self.preprocess_point_cloud(tgt_scaled, voxel_f, rn, rf)
