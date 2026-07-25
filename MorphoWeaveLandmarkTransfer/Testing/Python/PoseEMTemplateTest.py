@@ -1,5 +1,4 @@
 import ast
-import re
 import sys
 import unittest
 from pathlib import Path
@@ -20,7 +19,7 @@ def _load_source_function(name):
         node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == name
     )
-    namespace = {"re": re, "np": np}
+    namespace = {"np": np}
     exec(
         compile(
             ast.Module(body=[function], type_ignores=[]),
@@ -32,7 +31,6 @@ def _load_source_function(name):
     return namespace[name]
 
 
-stable_distribution_release = _load_source_function("stable_distribution_release")
 target_count_voxel_size = _load_source_function("target_count_voxel_size")
 
 
@@ -90,17 +88,17 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
         self.assertIn("logic.initialize_template_pose_em", source)
         self.assertIn("self.runPoseEMDeformable", source)
         self.assertIn('"pose_em_diagnostics.json"', source)
-        self.assertIn('"spec": "tiny3d-rs>=2.1,<3"', source)
-        self.assertIn('"spec": "rustcpd>=3.0,<4"', source)
-        self.assertIn('distributionInstalled("tiny3d")', source)
-        self.assertIn('pip_uninstall("tiny3d")', source)
-        self.assertIn("loaded_replacements", source)
-        self.assertIn("Restart Slicer, then reopen", source)
+        self.assertIn('"tiny3d-rs>=2.1,<3"', source)
+        self.assertIn('"rustcpd>=3.0,<4"', source)
+        self.assertIn('slicer.packaging.pip_check("tiny3d")', source)
+        self.assertIn('slicer.packaging.pip_uninstall(["tiny3d", "tiny3d-rs"])', source)
+        self.assertIn("slicer.packaging.pip_ensure(", source)
+        self.assertIn('requester="Landmark Transfer"', source)
+        self.assertIn("Restart Slicer, then retry", source)
         self.assertIn("rustcpd.register_atlas", source)
         self.assertIn("rustcpd.register_deformable", source)
         self.assertIn("np.asarray(pca.points)", source)
         self.assertIn("np.asarray(final.points)", source)
-        self.assertIn('getattr(rustcpd_module, "pose_initialize")', source)
         self.assertNotIn("pose_marginalized_initialization", source)
         self.assertNotIn("runFineDeformable", source)
         self.assertNotIn("blas_threads_limited", source)
@@ -114,16 +112,17 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
         self.assertNotIn('"key":"pointDensity"', source)
         self.assertNotIn("from biocpd", source)
         self.assertNotIn("from packaging", source)
-        self.assertIn("slicer.util.pip_install", source)
+        self.assertNotIn("stable_distribution_release", source)
+        self.assertNotIn("slicer.util.pip_install", source)
         self.assertNotIn("subprocess.check_call", source)
         self.assertNotIn("git+https://", source)
 
-    def test_distribution_release_parser_rejects_prereleases(self):
-        self.assertEqual(stable_distribution_release("3.0.0"), (3, 0, 0))
-        self.assertEqual(stable_distribution_release("2.1.0.post1"), (2, 1, 0))
-        self.assertEqual(stable_distribution_release("3.0+cpu"), (3, 0))
-        self.assertIsNone(stable_distribution_release("3.0.0rc1"))
-        self.assertIsNone(stable_distribution_release("2.1.0.dev2"))
+    def test_dependency_setup_runs_only_when_a_workflow_starts(self):
+        source = (MODULE_DIR / "MorphoWeaveLandmarkTransfer.py").read_text(encoding="utf-8")
+        self.assertNotIn("QTimer.singleShot(0, self._ensure_dependencies)", source)
+        for handler in ("onSubsampleButton", "onApplyLandmarkMulti", "onOptimize"):
+            body = source.split(f"  def {handler}(", 1)[1].split("\n  def ", 1)[0]
+            self.assertIn("if not self._ensure_dependencies():", body)
 
     def test_registration_voxel_size_targets_irregular_cloud_count(self):
         rng = np.random.default_rng(31)
