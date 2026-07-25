@@ -81,8 +81,8 @@ Optionally expand `Optional Model Library Save`, enable `Save SSM to Model Libra
 * **Keep aligned models and landmarks**: Defaults to True. Retains transformed derivatives in alignedModels/* and alignedLMs/*. Disable it to use a temporary processing workspace and omit these folders from the final output.
 * **Warp method**: Defaults to TPS (recommended). Warp using thin plate splines (TPS; more smooth and flexible) or biharmonic (more rigid).
   * * **Auto-fallback to TPS if biharmonic fails**: Defaults to True.
-* **Sampling radius (% of diag)**: Choose a value that will produce 2000 - 4000 expected dense correspondence points.
-* **Expected points**: Adjust `Sampling radius` and click `Preview Point Count` until desired count is achieved.
+* **Target dense points**: Requested number of existing atlas vertices used for dense correspondences. The default is 2,000; if the atlas has fewer vertices, all available vertices are used.
+* **Selected points**: Click `Preview Point Count` to confirm the resulting count before running the pipeline.
 
 <p align="center">
 <img src="images/6.png" width = 600>
@@ -182,7 +182,7 @@ Workflow labels use compact **Needs input**, **Ready**, **Optional**, and **Comp
 </p>
 
 1) Subsample source/target.
-Downsample source and target point clouds based on value set in Advanced ⟶ Point density and max projection ⟶ Point Density.
+Downsample the target toward the count set in Advanced ⟶ Point sampling and max projection ⟶ Target registration points. The solved target voxel resolution is also applied to the source.
 
 <p align="center">
 <img src="images/15.png" width = 600>
@@ -202,7 +202,7 @@ Global (RANSAC) and rigid (ICP) registration that register the source point clou
 </p>
 
 3) Run deformable alignment.
-Registration where source point cloud is deformed to target point cloud, then the registration is used to propagate the source landmarks to target specimen. Uses atlas/SSM as biological prior to avoid biologically implausible deformations (bioCPD) followed by CPD (coherent point drift) to capture local details.
+Registration where source point cloud is deformed to target point cloud, then the registration is used to propagate the source landmarks to target specimen. Uses rustcpd atlas/SSM registration as a biological prior to avoid biologically implausible deformations, followed by deformable CPD to capture local details.
 
 <p align="center">
 <img src="images/18.png" width = 600>
@@ -250,7 +250,7 @@ These steps are especially important for macroevolutionary comparative analyses 
 
 The current backend will either produce an optimized template or retain the baseline when it is already a good fit. The experimental backend applies the selected SSM shape in the original template frame and reports score margin, effective pose count, and evaluated/refined hypothesis counts. Pose-EM does not bypass any downstream stage: Single Run and Batch still perform the standard prescaling, RANSAC + ICP rigid alignment, PCA-CPD, and optional fine deformation.
 
-Pose-EM settings use biocpd's real-data algorithmic configuration: an exact budget of 193 total pose hypotheses, trajectory scoring after eight coarse iterations with all 193 hypotheses retained, 12 finalists, full-source/1,600-target refinement for 30 iterations, and pose-specific SSM/outlier weights of 0.1/0.05. These pose-specific weights are independent of downstream PCA-CPD. Landmark Transfer requests four pose workers while locally limiting supported BLAS libraries to one native thread; unsupported BLAS backends fall back to one worker for cross-platform safety. The initializer's already-refined coefficients are applied directly in the template frame, without a second dense completion. For incomplete targets, `Target completeness` prescales the SSM and fixes initializer scale; inspect ambiguity diagnostics carefully because partial or symmetric anatomy may support several poses.
+Pose-EM settings use MorphoWeave's rustcpd configuration: an exact budget of 193 total pose hypotheses, trajectory scoring after eight coarse iterations with all 193 hypotheses retained, 12 finalists, full-source/1,600-target refinement for 30 iterations, and pose-specific SSM/outlier weights of 5.0/0.15. These pose-specific weights are independent of downstream PCA-CPD. Parallel pose search is enabled by default and uses rustcpd's deterministic internal pool. The initializer's refined coefficients are applied directly in the template frame. For incomplete targets, `Target completeness` prescales the SSM and fixes initializer scale; inspect ambiguity diagnostics carefully because partial or symmetric anatomy may support several poses.
 
 <p align="center">
 <img src="images/23.png" width = 600>
@@ -263,8 +263,8 @@ Pose-EM settings use biocpd's real-data algorithmic configuration: an exact budg
 * **Skip template optimization (batch)**: Uses same template for all targets (faster)
 * **Target completeness (linear fraction)**: Fraction of specimen intact (0.5 = 50% complete)
 
-`Point density and max projection`
-* **Point Density**: Higher = more points, slower. Default 1.3
+`Point sampling and max projection`
+* **Target registration points**: Requested size of temporary registration clouds. Default 2,000. The target determines the voxel resolution used for both target and source; values below 1,600 limit Pose-EM refinement.
 * **Max projection factor (%)**: Max distance landmarks move to surface (% of size)
 
 `Rigid registration`

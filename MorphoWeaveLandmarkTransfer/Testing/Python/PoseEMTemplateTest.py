@@ -1,6 +1,7 @@
+import ast
+import re
 import sys
 import unittest
-from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,10 +12,35 @@ MODULE_DIR = Path(__file__).resolve().parents[2]
 if str(MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(MODULE_DIR))
 
+
+def _load_source_function(name):
+    source_path = MODULE_DIR / "MorphoWeaveLandmarkTransfer.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+    namespace = {"re": re, "np": np}
+    exec(
+        compile(
+            ast.Module(body=[function], type_ignores=[]),
+            filename=str(source_path),
+            mode="exec",
+        ),
+        namespace,
+    )
+    return namespace[name]
+
+
+stable_distribution_release = _load_source_function("stable_distribution_release")
+target_count_voxel_size = _load_source_function("target_count_voxel_size")
+
+
 from Resources.Python.PoseEMTemplate import (
     LEGACY_BACKEND,
     POSE_EM_BACKEND,
     PoseEMSettings,
+    _adapt_rustcpd_initialization,
     coverage_prescale,
     optimization_backend,
     pose_em_enabled,
@@ -25,27 +51,9 @@ from Resources.Python.PoseEMTemplate import (
 )
 
 
-class _ControlledBLAS:
-    def __init__(self):
-        self.limited = False
-
-    def select(self, **kwargs):
-        return SimpleNamespace(lib_controllers=[object()])
-
-    @contextmanager
-    def limit(self, **kwargs):
-        self.limited = True
-        self.limit_kwargs = kwargs
-        yield
-
-
-class _UnsupportedBLAS:
-    def select(self, **kwargs):
-        return SimpleNamespace(lib_controllers=[])
-
-
 def _initializer(coefficients, rotation, scale, translation):
     def initialize(*args, **kwargs):
+        initialize.args.append(args)
         initialize.calls.append(kwargs)
         return SimpleNamespace(
             coefficients=np.asarray(coefficients),
@@ -59,6 +67,7 @@ def _initializer(coefficients, rotation, scale, translation):
             hypotheses_evaluated=61,
             hypotheses_refined=2,
         )
+    initialize.args = []
     initialize.calls = []
     return initialize
 
@@ -81,10 +90,68 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
         self.assertIn("logic.initialize_template_pose_em", source)
         self.assertIn("self.runPoseEMDeformable", source)
         self.assertIn('"pose_em_diagnostics.json"', source)
-        self.assertIn('("biocpd","biocpd>=1.3")', source)
+        self.assertIn('"spec": "tiny3d-rs>=2.1,<3"', source)
+        self.assertIn('"spec": "rustcpd>=3.0,<4"', source)
+        self.assertIn('distributionInstalled("tiny3d")', source)
+        self.assertIn('pip_uninstall("tiny3d")', source)
+        self.assertIn("loaded_replacements", source)
+        self.assertIn("Restart Slicer, then reopen", source)
+        self.assertIn("rustcpd.register_atlas", source)
+        self.assertIn("rustcpd.register_deformable", source)
+        self.assertIn("np.asarray(pca.points)", source)
+        self.assertIn("np.asarray(final.points)", source)
+        self.assertIn('getattr(rustcpd_module, "pose_initialize")', source)
+        self.assertNotIn("pose_marginalized_initialization", source)
+        self.assertNotIn("runFineDeformable", source)
+        self.assertNotIn("blas_threads_limited", source)
+        self.assertNotIn("dense_completion_skipped", source)
+        self.assertNotIn("downstream_rigid", source)
+        self.assertIn('parameters.get("lambda_reg", 0.01)', source)
+        self.assertIn('parameters.get("w", 0.10)', source)
+        self.assertIn('parameters.get("max_iterations", 250)', source)
+        self.assertIn('"key":"registrationPointCount"', source)
+        self.assertIn('"value":2000', source)
+        self.assertNotIn('"key":"pointDensity"', source)
+        self.assertNotIn("from biocpd", source)
+        self.assertNotIn("from packaging", source)
         self.assertIn("slicer.util.pip_install", source)
         self.assertNotIn("subprocess.check_call", source)
         self.assertNotIn("git+https://", source)
+
+    def test_distribution_release_parser_rejects_prereleases(self):
+        self.assertEqual(stable_distribution_release("3.0.0"), (3, 0, 0))
+        self.assertEqual(stable_distribution_release("2.1.0.post1"), (2, 1, 0))
+        self.assertEqual(stable_distribution_release("3.0+cpu"), (3, 0))
+        self.assertIsNone(stable_distribution_release("3.0.0rc1"))
+        self.assertIsNone(stable_distribution_release("2.1.0.dev2"))
+
+    def test_registration_voxel_size_targets_irregular_cloud_count(self):
+        rng = np.random.default_rng(31)
+        points = rng.normal(size=(8000, 3)) * np.array([4.0, 1.4, 0.3])
+        points[:, 2] += 0.05 * points[:, 0] ** 2
+        voxel_size = target_count_voxel_size(points, 600)
+        origin = points.min(axis=0)
+        keys = np.floor((points - origin) / voxel_size).astype(np.int64)
+        count = len(np.unique(keys, axis=0))
+        self.assertLessEqual(abs(count - 600), 12)
+
+    def test_registration_target_count_drives_pose_and_shared_rigid_resolution(self):
+        source = (MODULE_DIR / "MorphoWeaveLandmarkTransfer.py").read_text(encoding="utf-8")
+        pose_prep = source.split("  def _pose_em_target_points(", 1)[1].split(
+            "  def runPoseEMDeformable", 1
+        )[0]
+        rigid = source.split("  def runSubsample(", 1)[1].split(
+            "  def propagateLandmarkTypes", 1
+        )[0]
+        legacy_optimizer = source.split("  def initialize_template(", 1)[1]
+
+        self.assertIn("target_count_voxel_size(", pose_prep)
+        self.assertIn('parameters.get("pointDensity", 1.3)', pose_prep)
+        self.assertIn("source_voxel_size = voxel_size", rigid)
+        self.assertIn("target_count_voxel_size(", rigid)
+        self.assertIn('parameters.get("pointDensity", 1.3)', rigid)
+        self.assertIn("target_count_voxel_size(", legacy_optimizer)
+        self.assertIn('parameters.get("pointDensity", 1.0)', legacy_optimizer)
 
     def test_pose_em_never_bypasses_standard_alignment_stages(self):
         source = (MODULE_DIR / "MorphoWeaveLandmarkTransfer.py").read_text(encoding="utf-8")
@@ -125,7 +192,7 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             optimization_backend({"optimizationBackend": "unknown"})
 
-    def test_settings_map_ui_values_to_biocpd_arguments(self):
+    def test_settings_map_ui_values_to_native_rustcpd_arguments(self):
         settings = PoseEMSettings.from_mapping({
             "poseRotationCount": 24,
             "poseCoarseSourceCount": 80,
@@ -143,7 +210,7 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
             "poseOutlierWeight": 0.15,
             "poseIdentityPrior": 0.25,
             "poseSeed": 7,
-            "poseNJobs": 2,
+            "poseParallel": False,
         })
         self.assertEqual(settings.rotation_count, 24)
         self.assertEqual(settings.refine_count, 1)
@@ -161,70 +228,85 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
             "refine_source_count": 70,
             "refine_target_count": 120,
             "refine_iterations": 9,
-            "lambda_reg": 0.03,
+            "lambda_regularization": 0.03,
             "outlier_weight": 0.15,
             "identity_prior_probability": 0.25,
             "seed": 7,
-            "n_jobs": 2,
+            "parallel": False,
         })
 
-    def test_defaults_match_biocpd_real_data_configuration(self):
+    def test_legacy_pose_worker_input_maps_to_parallel_boolean(self):
+        self.assertFalse(PoseEMSettings.from_mapping({"poseNJobs": 1}).parallel)
+        self.assertTrue(PoseEMSettings.from_mapping({"poseNJobs": 2}).parallel)
+        self.assertFalse(
+            PoseEMSettings.from_mapping({
+                "poseNJobs": 4,
+                "poseParallel": False,
+            }).parallel
+        )
+
+    def test_defaults_match_morphoweave_rustcpd_configuration(self):
         settings = PoseEMSettings.from_mapping({})
         self.assertEqual(settings.rotation_count, 193)
         self.assertEqual(settings.coarse_screen_iterations, 8)
         self.assertEqual(settings.coarse_survivor_count, 193)
         self.assertEqual(settings.coarse_score_mode, "trajectory")
         self.assertIsNone(settings.refine_source_count)
-        self.assertEqual(settings.lambda_reg, 0.1)
-        self.assertEqual(settings.outlier_weight, 0.05)
-        self.assertEqual(settings.n_jobs, 1)
+        self.assertEqual(settings.lambda_reg, 5.0)
+        self.assertEqual(settings.outlier_weight, 0.15)
+        self.assertTrue(settings.parallel)
 
-    def test_ui_uses_exact_real_data_defaults(self):
+    def test_ui_uses_morphoweave_native_rustcpd_defaults(self):
         source = (MODULE_DIR / "MorphoWeaveLandmarkTransfer.py").read_text(encoding="utf-8")
         self.assertIn('poseOptL.addRow("Total pose hypotheses:", self.poseRotationCount)', source)
         self.assertIn("self.poseRotationCount.value=193", source)
         self.assertIn('"poseCoarseScoreMode": "trajectory" if scoreModeIndex == 0 else "final"', source)
         self.assertIn('self.poseRefineSourceCount.setSpecialValueText("Full source")', source)
-        self.assertIn("self.poseLambdaReg.value=0.10", source)
-        self.assertIn("self.poseOutlierWeight.value=0.05", source)
-        self.assertIn("self.poseNJobs.value=4", source)
+        self.assertIn("self.poseLambdaReg.maximum=20.0", source)
+        self.assertIn("self.poseLambdaReg.value=5.0", source)
+        self.assertIn("self.poseOutlierWeight.value=0.15", source)
+        self.assertIn("self.poseParallel.checked=True", source)
+        self.assertIn('"poseParallel": bool(self.poseParallel.checked)', source)
+        self.assertNotIn('"poseNJobs":', source)
 
-    def test_supported_blas_uses_requested_workers_under_local_single_thread_limit(self):
-        mean = np.array([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
-        modes = np.zeros((2, 3, 1))
-        initializer = _initializer([0.0], np.eye(3), 1.0, [[0.0, 0.0, 0.0]])
-        controller = _ControlledBLAS()
-        result = run_pose_em_registration(
-            mean, mean, modes, np.array([1.0]),
-            PoseEMSettings(rotation_count=12, n_jobs=4),
-            with_scale=True,
-            initializer=initializer,
-            controller_factory=lambda: controller,
-        )
-        self.assertEqual(initializer.calls[0]["n_jobs"], 4)
-        self.assertTrue(controller.limited)
-        self.assertEqual(controller.limit_kwargs, {"limits": 1, "user_api": "blas"})
-        self.assertEqual(result.final_parameters["pose_workers_effective"], 4)
-        self.assertTrue(result.final_parameters["blas_threads_limited"])
-
-    def test_unsupported_blas_falls_back_to_one_pose_worker(self):
+    def test_parallel_setting_and_flattened_modes_are_forwarded_to_native_rustcpd(self):
         mean = np.array([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
         modes = np.zeros((2, 3, 1))
         initializer = _initializer([0.0], np.eye(3), 1.0, [[0.0, 0.0, 0.0]])
         result = run_pose_em_registration(
             mean, mean, modes, np.array([1.0]),
-            PoseEMSettings(rotation_count=12, n_jobs=4),
+            PoseEMSettings(rotation_count=12, parallel=True),
             with_scale=True,
             initializer=initializer,
-            controller_factory=_UnsupportedBLAS,
         )
-        self.assertEqual(initializer.calls[0]["n_jobs"], 1)
-        self.assertEqual(result.final_parameters["pose_workers_effective"], 1)
-        self.assertFalse(result.final_parameters["blas_threads_limited"])
+        self.assertTrue(initializer.calls[0]["parallel"])
+        self.assertEqual(initializer.calls[0]["lambda_regularization"], 5.0)
+        self.assertEqual(initializer.args[0][2].shape, (mean.size, 1))
+        self.assertTrue(result.final_parameters["pose_parallel"])
+        self.assertNotIn("blas_threads_limited", result.final_parameters)
+        self.assertNotIn("dense_completion_skipped", result.final_parameters)
 
-    def test_template_selection_skips_redundant_dense_completion(self):
+    def test_serial_pose_setting_is_forwarded_to_native_rustcpd(self):
+        mean = np.array([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+        modes = np.zeros((2, 3, 1))
+        initializer = _initializer([0.0], np.eye(3), 1.0, [[0.0, 0.0, 0.0]])
+        result = run_pose_em_registration(
+            mean, mean, modes, np.array([1.0]),
+            PoseEMSettings(rotation_count=12, parallel=False),
+            with_scale=True,
+            initializer=initializer,
+        )
+        self.assertFalse(initializer.calls[0]["parallel"])
+        self.assertFalse(result.final_parameters["pose_parallel"])
+
+    def test_template_selection_omits_redundant_dense_completion(self):
         helper = (MODULE_DIR / "Resources/Python/PoseEMTemplate.py").read_text(encoding="utf-8")
         self.assertNotIn("registration.register()", helper)
+        self.assertNotIn("dense_completion_skipped", helper)
+        self.assertNotIn("controller_factory", helper)
+        self.assertNotIn("n_jobs", helper)
+        self.assertNotIn("pose_marginalized_initialization", helper)
+        self.assertIn("from rustcpd import pose_initialize", helper)
 
     def test_ssm_sample_uses_native_coefficients_without_sqrt_eigen_scaling(self):
         mean = np.zeros((2, 3))
@@ -234,12 +316,27 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
         sample = ssm_sample(mean, modes, np.array([3.0, -0.5]))
         np.testing.assert_allclose(sample, [[3.0, 0.0, 0.0], [0.0, -1.0, 0.0]])
 
-    def test_similarity_matrix_matches_biocpd_row_point_convention(self):
+    def test_similarity_matrix_preserves_morphoweave_transform_convention(self):
         points = np.array([[1.0, 2.0, 3.0], [-1.0, 0.5, 2.0]])
         rotation = Rotation.from_euler("z", 90.0, degrees=True).as_matrix()
         translation = np.array([[4.0, -2.0, 0.5]])
         matrix = similarity_matrix(rotation, 1.5, translation)
         expected = 1.5 * (points @ rotation.T) + translation
+        np.testing.assert_allclose(transform_points(points, matrix), expected, atol=1e-12)
+
+    def test_rustcpd_direct_row_rotation_is_transposed_once_at_adapter_boundary(self):
+        points = np.array([[1.0, 2.0, 3.0], [-1.0, 0.5, 2.0]])
+        direct_rotation = Rotation.from_euler(
+            "xyz", [18.0, -27.0, 41.0], degrees=True
+        ).as_matrix().T
+        translation = np.array([[4.0, -2.0, 0.5]])
+        raw = SimpleNamespace(rotation=direct_rotation, marker="preserved")
+        adapted = _adapt_rustcpd_initialization(raw)
+
+        np.testing.assert_allclose(adapted.rotation, direct_rotation.T, atol=1e-12)
+        self.assertEqual(adapted.marker, "preserved")
+        matrix = similarity_matrix(adapted.rotation, 1.5, translation)
+        expected = 1.5 * (points @ direct_rotation) + translation
         np.testing.assert_allclose(transform_points(points, matrix), expected, atol=1e-12)
 
     def test_coverage_prescale_uses_expected_full_target_size(self):
@@ -260,7 +357,6 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
             mean, target, modes, eigenvalues, PoseEMSettings(rotation_count=12),
             with_scale=True,
             initializer=initializer,
-            controller_factory=_UnsupportedBLAS,
         )
         np.testing.assert_allclose(result.points, target, atol=1e-12)
         np.testing.assert_allclose(result.translation, translation, atol=1e-12)
@@ -270,7 +366,6 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
             atol=1e-12,
         )
         self.assertEqual(result.hypotheses_evaluated, 61)
-        self.assertTrue(result.final_parameters["dense_completion_skipped"])
 
     def test_fixed_scale_handoff_recenters_pose_and_disables_scale_optimization(self):
         mean = np.array([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
@@ -282,7 +377,6 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
             mean, target, modes, eigenvalues, PoseEMSettings(rotation_count=12),
             with_scale=False,
             initializer=_initializer([0.0], rotation, 0.4, [[9.0, 9.0, 9.0]]),
-            controller_factory=_UnsupportedBLAS,
         )
         self.assertAlmostEqual(result.scale, 1.0)
         np.testing.assert_allclose(result.points.mean(0), target.mean(0), atol=1e-12)
@@ -296,7 +390,6 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
             mean, target, modes, np.array([1.0]), PoseEMSettings(rotation_count=12),
             with_scale=False, source_scale=source_scale,
             initializer=_initializer([0.0], np.eye(3), 0.5, [[0.0, 0.0, 0.0]]),
-            controller_factory=_UnsupportedBLAS,
         )
         self.assertAlmostEqual(source_scale, 0.5)
         self.assertAlmostEqual(result.scale, source_scale)
@@ -304,11 +397,11 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
 
 
 class PoseEMTemplateIntegrationTest(unittest.TestCase):
-    def test_small_offset_target_retains_template_shape_without_dense_completion(self):
+    def test_small_offset_target_retains_template_shape_without_redundant_completion(self):
         try:
-            from biocpd import pose_marginalized_initialization
+            from rustcpd import pose_initialize
         except (ImportError, AttributeError):
-            self.skipTest("biocpd pose-EM API is unavailable")
+            self.skipTest("rustcpd pose-EM API is unavailable")
         rng = np.random.default_rng(17)
         mean = rng.normal(size=(80, 3)) * np.array([1.0, 0.55, 0.25])
         mean[:, 0] += 0.15 * mean[:, 1] ** 2
@@ -337,13 +430,12 @@ class PoseEMTemplateIntegrationTest(unittest.TestCase):
         selected_shape = ssm_sample(mean, modes, result.coefficients)
         self.assertGreater(np.linalg.norm(np.ptp(selected_shape, axis=0)), 0.9)
         self.assertTrue(np.isfinite(result.coefficients).all())
-        self.assertTrue(result.final_parameters["dense_completion_skipped"])
 
-    def test_large_rotation_recovery_through_atlas_adapter(self):
+    def test_large_rotation_recovery_through_rustcpd_adapter(self):
         try:
-            from biocpd import pose_marginalized_initialization
+            from rustcpd import pose_initialize
         except (ImportError, AttributeError):
-            self.skipTest("biocpd pose-EM API is unavailable")
+            self.skipTest("rustcpd pose-EM API is unavailable")
         rng = np.random.default_rng(19)
         mean = rng.normal(size=(60, 3)) * np.array([2.0, 1.1, 0.6])
         mean[:, 0] += 0.2 * mean[:, 1] ** 2

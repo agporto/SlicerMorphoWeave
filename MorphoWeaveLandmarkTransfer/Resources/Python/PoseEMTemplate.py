@@ -34,14 +34,19 @@ class PoseEMSettings:
     refine_source_count: Optional[int] = None
     refine_target_count: int = 1600
     refine_iterations: int = 30
-    lambda_reg: float = 0.1
-    outlier_weight: float = 0.05
+    lambda_reg: float = 5.0
+    outlier_weight: float = 0.15
     identity_prior_probability: float = 0.2
     seed: int = 0
-    n_jobs: int = 1
+    parallel: bool = True
 
     @classmethod
     def from_mapping(cls, parameters: Mapping[str, Any]) -> "PoseEMSettings":
+        parallel = (
+            bool(parameters["poseParallel"])
+            if "poseParallel" in parameters
+            else int(parameters.get("poseNJobs", -1)) != 1
+        )
         settings = cls(
             rotation_count=int(parameters.get("poseRotationCount", 193)),
             coarse_source_count=int(parameters.get("poseCoarseSourceCount", 400)),
@@ -59,11 +64,11 @@ class PoseEMSettings:
             ),
             refine_target_count=int(parameters.get("poseRefineTargetCount", 1600)),
             refine_iterations=int(parameters.get("poseRefineIterations", 30)),
-            lambda_reg=float(parameters.get("poseLambdaReg", 0.1)),
-            outlier_weight=float(parameters.get("poseOutlierWeight", 0.05)),
+            lambda_reg=float(parameters.get("poseLambdaReg", 5.0)),
+            outlier_weight=float(parameters.get("poseOutlierWeight", 0.15)),
             identity_prior_probability=float(parameters.get("poseIdentityPrior", 0.2)),
             seed=int(parameters.get("poseSeed", 0)),
-            n_jobs=int(parameters.get("poseNJobs", 1)),
+            parallel=parallel,
         )
         settings.validate()
         return settings
@@ -98,8 +103,6 @@ class PoseEMSettings:
             raise ValueError("outlier_weight must be in [0, 1)")
         if not 0 < self.identity_prior_probability < 1:
             raise ValueError("identity_prior_probability must be in (0, 1)")
-        if self.n_jobs != -1 and self.n_jobs < 1:
-            raise ValueError("n_jobs must be positive or -1")
 
     def initializer_kwargs(self) -> dict[str, Any]:
         return {
@@ -115,16 +118,16 @@ class PoseEMSettings:
             "refine_source_count": self.refine_source_count,
             "refine_target_count": self.refine_target_count,
             "refine_iterations": self.refine_iterations,
-            "lambda_reg": self.lambda_reg,
+            "lambda_regularization": self.lambda_reg,
             "outlier_weight": self.outlier_weight,
             "identity_prior_probability": self.identity_prior_probability,
             "seed": self.seed,
-            "n_jobs": self.n_jobs,
+            "parallel": self.parallel,
         }
 
 
-def _require_real_data_initializer(initializer: Callable[..., Any]) -> None:
-    """Fail clearly when an older 1.3.0 build is present under the same version."""
+def _require_native_pose_initializer(initializer: Callable[..., Any]) -> None:
+    """Fail clearly when the rustcpd native pose initializer is incomplete."""
     parameters = inspect.signature(initializer).parameters
     if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
         return
@@ -133,12 +136,13 @@ def _require_real_data_initializer(initializer: Callable[..., Any]) -> None:
         "coarse_survivor_count",
         "coarse_score_mode",
         "refine_source_count",
-        "n_jobs",
+        "lambda_regularization",
+        "parallel",
     }
     missing = sorted(required.difference(parameters))
     if missing:
         raise RuntimeError(
-            "Pose EM template optimization requires the biocpd real-data "
+            "Pose EM template optimization requires the rustcpd native "
             "initializer API; the installed build is missing: " + ", ".join(missing)
         )
 
@@ -234,51 +238,38 @@ def fixed_scale_translation(source: np.ndarray, target: np.ndarray, rotation: np
     return (target.mean(axis=0) - source.mean(axis=0) @ rotation.T).reshape(1, 3)
 
 
-def _biocpd_api() -> Callable[..., Any]:
+class _RustPoseInitializationAdapter:
+    """Expose rustcpd's direct-row rotation in MorphoWeave's legacy convention."""
+
+    def __init__(self, initialization: Any):
+        self._initialization = initialization
+        # rustcpd 3 applies row points as points @ rotation. MorphoWeave's
+        # established internal convention applies points @ rotation.T.
+        self.rotation = np.asarray(initialization.rotation, dtype=np.float64).T.copy()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._initialization, name)
+
+
+def _adapt_rustcpd_initialization(initialization: Any) -> Any:
+    return _RustPoseInitializationAdapter(initialization)
+
+
+def _rustcpd_api() -> Callable[..., Any]:
     try:
-        from biocpd import pose_marginalized_initialization
+        from rustcpd import pose_initialize
     except (ImportError, AttributeError) as exc:
         raise RuntimeError(
-            "Pose EM template optimization requires biocpd 1.3 or newer. "
-            "Upgrade biocpd in the Slicer Python environment."
+            "Pose EM template optimization requires rustcpd 3 or newer. "
+            "Upgrade rustcpd in the Slicer Python environment."
         ) from exc
-    return pose_marginalized_initialization
 
+    def initialize(*args: Any, **kwargs: Any) -> Any:
+        return _adapt_rustcpd_initialization(
+            pose_initialize(*args, **kwargs)
+        )
 
-def _initialize_with_thread_policy(
-    initializer: Callable[..., Any],
-    initializer_args: tuple[Any, ...],
-    initializer_kwargs: Mapping[str, Any],
-    requested_n_jobs: int,
-    controller_factory: Optional[Callable[[], Any]] = None,
-) -> tuple[Any, int, bool]:
-    """Limit nested BLAS threads when supported, otherwise use one pose worker."""
-    if controller_factory is None:
-        try:
-            from threadpoolctl import ThreadpoolController
-        except ImportError:
-            ThreadpoolController = None
-        controller_factory = ThreadpoolController
-
-    controller = None
-    if controller_factory is not None:
-        try:
-            candidate = controller_factory()
-            if candidate.select(user_api="blas").lib_controllers:
-                controller = candidate
-        except Exception:
-            controller = None
-
-    effective_n_jobs = int(requested_n_jobs) if controller is not None else 1
-    kwargs = dict(initializer_kwargs)
-    kwargs["n_jobs"] = effective_n_jobs
-    if controller is None:
-        return initializer(*initializer_args, **kwargs), effective_n_jobs, False
-
-    # Keep the limit local to Pose EM. Independent hypotheses run in Python
-    # workers while each supported BLAS backend stays sequential.
-    with controller.limit(limits=1, user_api="blas"):
-        return initializer(*initializer_args, **kwargs), effective_n_jobs, True
+    return initialize
 
 
 def run_pose_em_registration(
@@ -291,7 +282,6 @@ def run_pose_em_registration(
     with_scale: bool,
     source_scale: float = 1.0,
     initializer: Optional[Callable[..., Any]] = None,
-    controller_factory: Optional[Callable[[], Any]] = None,
 ) -> PoseEMRegistrationResult:
     mean, modes, eigenvalues = validate_ssm(mean, modes, eigenvalues)
     target = np.asarray(target, dtype=np.float64)
@@ -309,15 +299,19 @@ def run_pose_em_registration(
     working_target = target - target_centroid
     working_modes = modes * float(source_scale)
     if initializer is None:
-        initializer = _biocpd_api()
-    _require_real_data_initializer(initializer)
+        initializer = _rustcpd_api()
+    _require_native_pose_initializer(initializer)
 
-    initial, effective_n_jobs, blas_limited = _initialize_with_thread_policy(
-        initializer,
-        (working_mean, working_target, working_modes, eigenvalues),
-        settings.initializer_kwargs(),
-        settings.n_jobs,
-        controller_factory=controller_factory,
+    working_modes_flat = working_modes.reshape(
+        working_mean.size,
+        working_modes.shape[2],
+    )
+    initial = initializer(
+        working_mean,
+        working_target,
+        working_modes_flat,
+        eigenvalues,
+        **settings.initializer_kwargs(),
     )
     coefficients = np.asarray(initial.coefficients, dtype=np.float64).reshape(-1)
     rotation = np.asarray(initial.rotation, dtype=np.float64)
@@ -330,8 +324,8 @@ def run_pose_em_registration(
         translation = fixed_scale_translation(initial_shape, working_target, rotation)
 
     # The initializer has already refined its finalists. Template optimization
-    # needs only those coefficients; a second dense AtlasRegistration pass was
-    # redundant and its registered coordinates were discarded by MorphoWeaveLandmarkTransfer.
+    # needs only those coefficients; a second dense atlas pass was redundant
+    # and its registered coordinates were discarded by MorphoWeaveLandmarkTransfer.
     points_centered = scale * (initial_shape @ rotation.T) + translation
     final_scale = float(source_scale) * scale
     final_translation = (
@@ -350,10 +344,7 @@ def run_pose_em_registration(
         "source_centroid": source_centroid.copy(),
         "target_centroid": target_centroid.copy(),
         "source_scale": float(source_scale),
-        "pose_workers_requested": int(settings.n_jobs),
-        "pose_workers_effective": effective_n_jobs,
-        "blas_threads_limited": blas_limited,
-        "dense_completion_skipped": True,
+        "pose_parallel": bool(settings.parallel),
     }
     return PoseEMRegistrationResult(
         points=points,
