@@ -369,7 +369,7 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
   # ----- Parameter schema (declarative Advanced tab) -----
   PARAMS = [
     {"key":"skipScaling","kind":"check","label":"Skip scaling","section":"General Settings","value":False},
-    {"key":"skipProjection","kind":"check","label":"Skip projection","section":"General Settings","value":False},
+    {"key":"skipProjection","kind":"check","label":"Skip projection","section":"General Settings","value":True},
     {"key":"skipOptimization","kind":"check","label":"Skip template optimization (batch)","section":"General Settings","value":False},
     {"key":"targetCoverage","kind":"dspin","label":"Target completeness (linear fraction)","section":"General Settings", "min":0.05,"max":1.0,"step":0.01,"value":1.0,"decimals":2},
     {"key":"registrationPointCount","kind":"spin","label":"Target registration points","section":"Point sampling and max projection","min":100,"max":1_000_000,"step":100,"value":2000,
@@ -872,7 +872,7 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
   def onSelectMultiProcess(self): self._enable_batch()
 
   def _proj_frac(self):
-    d=self.parameterDictionary; return 0.0 if d.get("skipProjection", False) else float(d.get("projectionFactor",1.0))/100.0
+    d=self.parameterDictionary; return 0.0 if d.get("skipProjection", True) else float(d.get("projectionFactor",1.0))/100.0
 
   # ----- Single alignment flow -----
   def onSubsampleButton(self):
