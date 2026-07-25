@@ -1,4 +1,4 @@
-import os, logging, copy, json, time, html, re, numpy as np
+import os, logging, copy, json, time, html, numpy as np
 import vtk, qt, ctk, slicer
 from slicer.ScriptedLoadableModule import *
 import vtk.util.numpy_support as vtk_np
@@ -16,14 +16,6 @@ from Resources.Python.PoseEMTemplate import (
 )
 
 # ---------- Small utilities----------
-
-def stable_distribution_release(version_text):
-  """Return stable release components, rejecting prerelease version strings."""
-  match = re.fullmatch(
-    r"\s*(\d+(?:\.\d+)*)(?:\.post\d+)?(?:\+[A-Za-z0-9][A-Za-z0-9._-]*)?\s*",
-    str(version_text),
-  )
-  return tuple(int(part) for part in match.group(1).split(".")) if match else None
 
 def target_count_voxel_size(points, target_count, tolerance=0.02, max_iterations=40):
   points = np.asarray(points, dtype=np.float64)
@@ -184,146 +176,59 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
   def __init__(self, parent=None):
     ScriptedLoadableModuleWidget.__init__(self, parent)
     self.cloneFolderItemID = None
-    self._deps_ready = False
-    qt.QTimer.singleShot(0, self._ensure_dependencies)
 
   # ----- Slicer-native dependency installer -----
   def _ensure_dependencies(self):
-    import importlib, importlib.metadata, inspect, traceback, sys
+    import importlib
+    import slicer.packaging
+    import sys
 
-    required = {
-      "tiny3d-rs": {
-        "spec": "tiny3d-rs>=2.1,<3",
-        "module": "tiny3d",
-        "minimum": (2, 1),
-        "maximum": (3,),
-      },
-      "rustcpd": {
-        "spec": "rustcpd>=3.0,<4",
-        "module": "rustcpd",
-        "minimum": (3,),
-        "maximum": (4,),
-      },
-    }
+    requirements = ["tiny3d-rs>=2.1,<3", "rustcpd>=3.0,<4"]
+    legacy_tiny3d_installed = slicer.packaging.pip_check("tiny3d")
 
-    def distributionVersion(distribution_name):
-      try:
-        version_text = importlib.metadata.version(distribution_name)
-      except importlib.metadata.PackageNotFoundError:
-        return None
-      # Accept stable, post, and local releases. Reject prereleases because
-      # they do not satisfy pip's stable >= floor without an explicit opt-in.
-      return stable_distribution_release(version_text)
-
-    def distributionInstalled(distribution_name):
-      try:
-        importlib.metadata.version(distribution_name)
-        return True
-      except importlib.metadata.PackageNotFoundError:
-        return False
-
-    def hasCompatibleDistribution(distribution_name):
-      requirement = required[distribution_name]
-      version = distributionVersion(distribution_name)
-      return bool(
-        version is not None
-        and requirement["minimum"] <= version < requirement["maximum"]
-      )
-
-    def hasPoseAPI():
-      if not hasCompatibleDistribution("rustcpd"):
-        return False
-      try:
-        rustcpd_module = importlib.import_module("rustcpd")
-        initializer = getattr(rustcpd_module, "pose_initialize")
-        parameters = inspect.signature(initializer).parameters
-        return all(name in parameters for name in (
-          "coarse_screen_iterations", "coarse_survivor_count",
-          "coarse_score_mode", "refine_source_count",
-          "lambda_regularization", "parallel",
-        ))
-      except Exception:
-        return False
-
-    legacy_tiny3d_installed = distributionInstalled("tiny3d")
-    missing = [
-      name for name in required
-      if not hasCompatibleDistribution(name)
-    ]
-    if not hasPoseAPI() and "rustcpd" not in missing:
-      missing.append("rustcpd")
-    if legacy_tiny3d_installed and "tiny3d-rs" not in missing:
-      # Both distributions own the same tiny3d import package. Reinstall the
-      # Rust distribution after removing the legacy wheel so shared files are
-      # not left missing.
-      missing.append("tiny3d-rs")
-
-    loaded_replacements = [
-      required[name]["module"] for name in missing
-      if any(
-        module_name == required[name]["module"]
-        or module_name.startswith(required[name]["module"] + ".")
-        for module_name in sys.modules
-      )
-    ]
-    if loaded_replacements:
+    # The legacy and Rust distributions both own the tiny3d import package.
+    # Replace both from a clean state so uninstalling either cannot remove
+    # files belonging to the selected backend.
+    if legacy_tiny3d_installed and any(
+      name == "tiny3d" or name.startswith("tiny3d.")
+      for name in sys.modules
+    ):
       slicer.util.infoDisplay(
-        "Landmark Transfer must replace an already loaded native backend "
-        f"({', '.join(loaded_replacements)}). Restart Slicer, then reopen "
-        "Landmark Transfer to install the Rust backend safely. No packages "
-        "were changed."
+        "Landmark Transfer must replace the already loaded legacy tiny3d "
+        "backend. Restart Slicer, then retry the operation to install the "
+        "Rust backend safely. No packages were changed."
       )
-      return
+      return False
 
-    if missing:
-      labels = [required[name]["spec"] for name in missing]
-      msg = "Landmark Transfer needs or must upgrade: " + ", ".join(labels) + "."
-      if legacy_tiny3d_installed:
-        msg += "\nThe legacy tiny3d distribution must be removed before tiny3d-rs is installed."
-      msg += "\nInstall now?"
-      if not slicer.util.confirmOkCancelDisplay(msg):
-        slicer.util.errorDisplay("Dependencies not installed; some actions may fail.")
-        return
+    if legacy_tiny3d_installed and not slicer.util.confirmOkCancelDisplay(
+      "Landmark Transfer must remove the legacy tiny3d distribution and "
+      "install tiny3d-rs>=2.1,<3 and rustcpd>=3.0,<4.\n\nContinue?"
+    ):
+      slicer.util.showStatusMessage("Landmark Transfer dependencies were not changed.", 3000)
+      return False
 
-    self._deps_ready = False
     try:
       if legacy_tiny3d_installed:
-        pip_uninstall = getattr(slicer.util, "pip_uninstall", None)
-        if pip_uninstall is None:
-          raise RuntimeError(
-            "This Slicer build cannot remove the legacy tiny3d distribution. "
-            "Uninstall tiny3d manually, restart Slicer, and reopen Landmark Transfer."
-          )
-        pip_uninstall("tiny3d")
+        slicer.packaging.pip_uninstall(["tiny3d", "tiny3d-rs"])
 
-      if missing:
-        for package_name in [required[name]["module"] for name in missing]:
-          for module_name in [
-            name for name in sys.modules
-            if name == package_name or name.startswith(package_name + ".")
-          ]:
-            sys.modules.pop(module_name, None)
-        importlib.invalidate_caches()
-        specs = [required[name]["spec"] for name in missing]
-        install_args = ["--upgrade"]
-        if legacy_tiny3d_installed:
-          install_args.append("--force-reinstall")
-        slicer.util.pip_install([*install_args, *specs])
-        importlib.invalidate_caches()
-
+      slicer.packaging.pip_ensure(
+        requirements,
+        prompt_install=not legacy_tiny3d_installed,
+        requester="Landmark Transfer",
+      )
+      importlib.invalidate_caches()
       for module_name in ("tiny3d", "rustcpd", "scipy.spatial", "scipy.optimize"):
         importlib.import_module(module_name)
-      if not hasCompatibleDistribution("tiny3d-rs"):
-        raise RuntimeError("A compatible tiny3d-rs>=2.1,<3 distribution is not installed.")
-      if not hasPoseAPI():
-        raise RuntimeError(
-          "The installed rustcpd>=3.0,<4 wheel does not provide the required native Pose-EM API."
-        )
     except Exception as error:
-      slicer.util.errorDisplay(f"Landmark Transfer dependency installation failed:\n{error}\n{traceback.format_exc()}")
-      return
-    self._deps_ready = True
+      if isinstance(error, RuntimeError) and str(error) == "User declined package installation":
+        slicer.util.showStatusMessage("Landmark Transfer dependencies were not installed.", 3000)
+        return False
+      logging.exception("Landmark Transfer dependency setup failed")
+      slicer.util.errorDisplay(f"Landmark Transfer dependency setup failed:\n{error}")
+      return False
+
     slicer.util.showStatusMessage("Landmark Transfer: dependencies ready", 3000)
+    return True
 
 
   # ----- Visual helpers -----
@@ -876,6 +781,8 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
 
   # ----- Single alignment flow -----
   def onSubsampleButton(self):
+    if not self._ensure_dependencies():
+      return
     logic = MorphoWeaveLandmarkTransferLogic(); self._hideInputNodes()
     srcOrig = self.sourceModelSelector.currentNode(); tgtOrig = self.targetModelSelector.currentNode()
     corresOrig  = self.sourceFiducialSelector.currentNode(); lmOrig  = self.sourceSparseFiducialSelector.currentNode()
@@ -1037,6 +944,8 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
 
   # ----- Batch processing -----
   def onApplyLandmarkMulti(self):
+    if not self._ensure_dependencies():
+      return
     logic = MorphoWeaveLandmarkTransferLogic(); projectionFactor = self._proj_frac(); d=self.parameterDictionary
     self._cancelBatch=False; self.batchProgress.setValue(0); self.batchCancelButton.enabled=True
     last_ui_pump = [0.0]
@@ -1092,6 +1001,8 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
 
   # ----- Optimization -----
   def onOptimize(self):
+      if not self._ensure_dependencies():
+          return
       logic = MorphoWeaveLandmarkTransferLogic()
       tplModelOrig = self.d2sourceModelSelector.currentNode()
       tplCorrOrig  = self.d2sourceFiducialSelector.currentNode()
