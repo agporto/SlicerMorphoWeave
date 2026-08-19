@@ -190,6 +190,24 @@ class ShapeCompletionModuleSourceTest(unittest.TestCase):
         self.assertIn("dense_latent_point_cloud", source)
         self.assertIn("latent coefficient posterior", source)
 
+    def test_ctk_double_spinbox_suffixes_use_pythonqt_properties(self):
+        source = MODULE.read_text(encoding="utf-8")
+        self.assertNotIn(".setSuffix(", source)
+        self.assertIn('self.calibration_success_threshold.suffix = " %"', source)
+        self.assertIn('self.landmark_sigma_percent.suffix = " %"', source)
+
+    def test_enter_is_guarded_when_setup_did_not_finish(self):
+        source = MODULE.read_text(encoding="utf-8")
+        self.assertIn("self._ui_ready = False", source)
+        setup = source.split("    def setup(self):", 1)[1].split(
+            "    def _preflight_dependencies", 1
+        )[0]
+        self.assertIn("self._ui_ready = True", setup)
+        enter = source.split("    def enter(self):", 1)[1].split(
+            "    def cleanup", 1
+        )[0]
+        self.assertIn("if not self._ui_ready:", enter)
+
     def test_module_tutorial_is_packaged(self):
         tutorial = MODULE_DIR / "TUTORIAL.md"
         self.assertTrue(tutorial.is_file())
