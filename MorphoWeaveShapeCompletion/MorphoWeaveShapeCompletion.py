@@ -145,9 +145,11 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
         self._cancel_calibration = False
         self._run_folder_item = None
         self._profile = None
+        self._ui_ready = False
 
     def setup(self):
         super().setup()
+        self._ui_ready = False
         self.logic = MorphoWeaveShapeCompletionLogic()
         self._build_ui()
         self._connect_ui()
@@ -155,6 +157,7 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
         self._validate_complete_inputs()
         self._validate_calibration_inputs()
         self.layout.addStretch(1)
+        self._ui_ready = True
         # Resolve the native backend when the module opens so the user does not
         # first encounter installation latency after pressing Run.
         qt.QTimer.singleShot(0, self._preflight_dependencies)
@@ -373,7 +376,7 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
         self.calibration_success_threshold.singleStep = 0.5
         self.calibration_success_threshold.value = 3.0
         self.calibration_success_threshold.setDecimals(1)
-        self.calibration_success_threshold.setSuffix(" %")
+        self.calibration_success_threshold.suffix = " %"
         self.calibration_success_threshold.setToolTip(
             "A fit is labelled successful when inferred-region RMS error is no more than this percentage of the complete-shape bounding-box diagonal."
         )
@@ -452,7 +455,7 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
         self.landmark_sigma_percent.singleStep = 0.25
         self.landmark_sigma_percent.value = 2.0
         self.landmark_sigma_percent.setDecimals(2)
-        self.landmark_sigma_percent.setSuffix(" %")
+        self.landmark_sigma_percent.suffix = " %"
         self.landmark_sigma_percent.setToolTip(
             "Target-landmark localization standard deviation τ as a percentage of the expected full-shape RMS radius. The same τ is used in pose scoring, pose refinement, and atlas registration."
         )
@@ -615,6 +618,10 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
         self.calibration_cancel_button.clicked.connect(self.on_cancel_calibration)
 
     def enter(self):
+        # Slicer can call enter() again after setup() fails. Avoid a secondary
+        # traceback from UI attributes that were never constructed.
+        if not self._ui_ready:
+            return
         self._auto_select_canonical_ssm_set()
         self._validate_complete_inputs()
         self._validate_calibration_inputs()
