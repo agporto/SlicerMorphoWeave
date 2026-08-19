@@ -448,6 +448,7 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
         self.scale_policy_combo.addItems(
             ["Automatic (free at 1.0; fixed for fragments)", "Always free", "Always fixed"]
         )
+        self.scale_policy_combo.setCurrentIndex(1)
         form.addRow("Residual scale policy:", self.scale_policy_combo)
         self.landmark_sigma_percent = ctk.ctkDoubleSpinBox()
         self.landmark_sigma_percent.minimum = 0.05
