@@ -16,6 +16,7 @@ include(${Slicer_USE_FILE})
 
 add_subdirectory(MorphoWeaveModelLibrary)
 add_subdirectory(MorphoWeaveAtlasBuilder)
+add_subdirectory(MorphoWeaveShapeCompletion)
 add_subdirectory(MorphoWeaveLandmarkTransfer)
 add_subdirectory(MorphoWeaveSurfaceSegmentation)
 
