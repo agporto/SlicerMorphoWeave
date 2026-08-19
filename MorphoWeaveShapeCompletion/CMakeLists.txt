@@ -10,7 +10,6 @@ set(MODULE_PYTHON_RESOURCES
   README.md
   TUTORIAL.md
   Resources/Icons/${MODULE_NAME}.png
-  Resources/Python/__init__.py
   Resources/Python/MorphoWeaveShapeCompletionCore.py
   )
 
