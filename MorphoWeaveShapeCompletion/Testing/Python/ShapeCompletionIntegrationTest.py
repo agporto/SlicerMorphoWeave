@@ -117,7 +117,7 @@ def function_with_parameters(names):
 
 
 def valid_backend():
-    backend = types.SimpleNamespace(__version__="3.1.0")
+    backend = types.SimpleNamespace(__version__="4.0.0")
     backend.pose_initialize = function_with_parameters(
         "rotation_count coarse_source_count coarse_target_count coarse_rank coarse_iterations "
         "coarse_screen_iterations coarse_survivor_count coarse_score_mode refine_count "
@@ -236,10 +236,10 @@ class ShapeCompletionIntegrationTest(unittest.TestCase):
         self.widget.batch_ssm_table.setCurrentNode(value)
         self.assertIs(self.widget.ssm_table_selector.currentNode(), value)
 
-    def test_requires_released_31_or_newer_and_retains_cache(self):
+    def test_requires_supported_release_range_and_retains_cache(self):
         self.assertTrue(self.widget._ensure_dependencies())
         self.packaging.pip_ensure.assert_called_once_with(
-            ["rustcpd>=3.1,<4"], prompt_install=True, requester="Shape Completion")
+            ["rustcpd>=3.1,<5"], prompt_install=True, requester="Shape Completion")
         self.assertTrue(self.widget._ensure_dependencies())
         self.assertEqual(self.packaging.pip_ensure.call_count, 1)
 
@@ -252,16 +252,35 @@ class ShapeCompletionIntegrationTest(unittest.TestCase):
         self.assertNotIn("development branch", message)
 
     def test_future_major_and_prerelease_are_not_accepted(self):
-        for version in ("4.0.0", "3.1.0rc1", "garbage"):
+        for version in ("5.0.0", "3.0.0", "3.1.0rc1", "4.0.0rc1",
+                        "4.0.0.dev1", "4.0.0+", "4.0.0+foo..bar", "garbage"):
             with self.subTest(version=version):
                 self.backend.__version__ = version
                 with self.assertRaises(RuntimeError):
                     self.module.validate_completion_backend(self.backend)
 
     def test_minor_post_and_local_versions_are_supported(self):
-        for version in ("3.1.0", "3.2.1", "3.1.0.post1", "3.1.0+local"):
+        for version in ("3.1.0", "3.2.1", "3.1.0.post1", "3.1.0+local",
+                        "4.0.0", "4.1.2", "4.0.0.post1", "4.0.0+local"):
             self.backend.__version__ = version
             self.module.validate_completion_backend(self.backend)
+
+    def test_released_400_passes_public_preflight(self):
+        self.backend.__version__ = "4.0.0"
+        self.assertTrue(self.widget._ensure_dependencies())
+        self.slicer.util.errorDisplay.assert_not_called()
+        self.assertTrue(self.widget._deps_ready)
+
+    def test_31_is_still_accepted_for_existing_environments(self):
+        self.backend.__version__ = "3.1.0"
+        self.assertTrue(self.widget._ensure_dependencies())
+        self.slicer.util.errorDisplay.assert_not_called()
+
+    def test_400_with_missing_posterior_api_is_not_accepted(self):
+        self.backend.__version__ = "4.0.0"
+        del self.backend.AtlasResult.posterior
+        self.assertFalse(self.widget._ensure_dependencies())
+        self.assertIn("AtlasResult.posterior", self.slicer.util.errorDisplay.call_args.args[0])
 
     def test_capability_checks_reject_missing_landmark_parameter(self):
         signature = self.backend.pose_initialize.__signature__

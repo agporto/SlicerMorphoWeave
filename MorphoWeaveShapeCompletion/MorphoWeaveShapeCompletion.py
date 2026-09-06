@@ -8,6 +8,8 @@ import inspect
 import logging
 import re
 
+import slicer
+
 # Preserve the module's existing public helpers and logic for Slicer scripts.
 from Resources.Python.MorphoWeaveShapeCompletionBase import *  # noqa: F401,F403
 from Resources.Python.MorphoWeaveShapeCompletionBase import (
@@ -18,7 +20,7 @@ from Resources.Python.MorphoWeaveShapeCompletionBase import (
 from Resources.Python.MorphoWeaveShapeCompletionBatch import ShapeCompletionBatchMixin
 
 
-RUSTCPD_REQUIREMENT = "rustcpd>=3.1,<4"
+RUSTCPD_REQUIREMENT = "rustcpd>=3.1,<5"
 
 
 def validate_completion_backend(backend):
@@ -76,8 +78,11 @@ def validate_completion_backend(backend):
     # pip may have upgraded the files while an older extension is still loaded.
     version = getattr(backend, "__version__", None)
     if version is not None:
-        release = re.fullmatch(r"3\.(\d+)\.\d+(?:\.post\d+)?(?:\+[A-Za-z0-9._-]+)?", str(version))
-        if release is None or int(release.group(1)) < 1:
+        release = re.fullmatch(
+            r"([34])\.(\d+)\.\d+(?:\.post\d+)?(?:\+[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*)?",
+            str(version),
+        )
+        if release is None or (int(release.group(1)) == 3 and int(release.group(2)) < 1):
             missing.append(f"supported loaded version (found {version})")
     if missing:
         raise RuntimeError(
@@ -95,7 +100,9 @@ class MorphoWeaveShapeCompletion(_CompletionModule):
         self.parent.helpText += (
             " Use the Batch tab to process a directory of fragments with the "
             "same model and settings, optional paired landmarks, and resumable exports."
-            " Shape Completion requires rustcpd>=3.1,<4."
+            f" Shape Completion requires {RUSTCPD_REQUIREMENT}."
+            " When upgrading from rustcpd 3.1 to 4.0, revalidate completions and "
+            "regenerate calibration profiles; posterior results are not numerically equivalent."
         )
 
 
