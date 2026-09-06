@@ -89,7 +89,7 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
         self.assertIn("self.runPoseEMDeformable", source)
         self.assertIn('"pose_em_diagnostics.json"', source)
         self.assertIn('"tiny3d-rs>=2.1,<3"', source)
-        self.assertIn('"rustcpd>=3.0,<4"', source)
+        self.assertIn('"rustcpd==4.0.0"', source)
         self.assertIn('slicer.packaging.pip_check("tiny3d")', source)
         self.assertIn('slicer.packaging.pip_uninstall(["tiny3d", "tiny3d-rs"])', source)
         self.assertIn("slicer.packaging.pip_ensure(", source)

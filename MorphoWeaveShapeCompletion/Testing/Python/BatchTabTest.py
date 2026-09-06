@@ -397,6 +397,15 @@ class BatchTabTest(unittest.TestCase):
         log_patch.start()
         self.addCleanup(log_patch.stop)
         self.widget = self.main.MorphoWeaveShapeCompletionWidget()
+        # This suite doubles the fitter/backend and tests workflow behavior.
+        # Patch the public gate, not the now-shadowed base method. Exact version
+        # and capability checks are exercised in ShapeCompletionIntegrationTest.
+        dependency_gate = patch.object(
+            self.widget, "_ensure_dependencies",
+            side_effect=lambda: self.widget.dependencies_available,
+        )
+        dependency_gate.start()
+        self.addCleanup(dependency_gate.stop)
         self.widget.setup()
         for name in ("template_model_selector", "template_dense_selector", "template_sparse_selector",
                      "ssm_table_selector", "target_model_selector", "target_landmark_selector"):

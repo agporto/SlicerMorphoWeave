@@ -4,6 +4,7 @@ import inspect
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 import time
 import traceback
@@ -871,13 +872,24 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
         import slicer.packaging
 
         try:
+            loaded_rustcpd = sys.modules.get("rustcpd")
+            if loaded_rustcpd is not None and getattr(loaded_rustcpd, "__version__", None) != "4.0.0":
+                raise RuntimeError(
+                    "Shape Completion requires rustcpd==4.0.0. Another version is already "
+                    "loaded; restart Slicer before updating it. No packages were changed."
+                )
             slicer.packaging.pip_ensure(
-                ["rustcpd>=3.0,<4"],
+                ["rustcpd==4.0.0"],
                 prompt_install=True,
                 requester="Shape Completion",
             )
             importlib.invalidate_caches()
             rustcpd = importlib.import_module("rustcpd")
+            if getattr(rustcpd, "__version__", None) != "4.0.0":
+                raise RuntimeError(
+                    "Shape Completion requires rustcpd==4.0.0. Install that release "
+                    "and restart Slicer before running completion."
+                )
             pose_parameters = inspect.signature(rustcpd.pose_initialize).parameters
             atlas_parameters = inspect.signature(rustcpd.register_atlas).parameters
             missing = []
@@ -992,8 +1004,8 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
                 raise RuntimeError(
                     "The installed rustcpd build lacks the constrained shape-completion API: "
                     + ", ".join(missing)
-                    + ". Install a build containing the pose-landmark-keypoints functionality. "
-                    "Because that development branch still reports version 3.0.0, an older 3.0.0 wheel may need to be explicitly uninstalled or force-reinstalled."
+                    + ". Install the released rustcpd==4.0.0 wheel with the "
+                    "pose-landmark-keypoints functionality, then restart Slicer."
                 )
             self._deps_ready = True
             return True

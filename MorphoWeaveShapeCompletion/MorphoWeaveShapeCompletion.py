@@ -6,7 +6,7 @@ requirements and synchronization of the two tabs belong to this entry point.
 import importlib
 import inspect
 import logging
-import re
+import sys
 
 import slicer
 
@@ -20,11 +20,11 @@ from Resources.Python.MorphoWeaveShapeCompletionBase import (
 from Resources.Python.MorphoWeaveShapeCompletionBatch import ShapeCompletionBatchMixin
 
 
-RUSTCPD_REQUIREMENT = "rustcpd>=3.1,<5"
+RUSTCPD_REQUIREMENT = "rustcpd==4.0.0"
 
 
 def validate_completion_backend(backend):
-    """Keep capability checks even when a wheel satisfies the version range."""
+    """Keep capability checks even when a wheel reports the pinned release."""
     required_parameters = {
         "pose_initialize": (
             "rotation_count", "coarse_source_count", "coarse_target_count",
@@ -77,20 +77,15 @@ def validate_completion_backend(backend):
             missing.extend(f"{class_name}.{name}" for name in names if not hasattr(cls, name))
     # pip may have upgraded the files while an older extension is still loaded.
     version = getattr(backend, "__version__", None)
-    if version is not None:
-        release = re.fullmatch(
-            r"([34])\.(\d+)\.\d+(?:\.post\d+)?(?:\+[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*)?",
-            str(version),
-        )
-        if release is None or (int(release.group(1)) == 3 and int(release.group(2)) < 1):
-            missing.append(f"supported loaded version (found {version})")
+    if version != "4.0.0":
+        missing.append(f"loaded rustcpd==4.0.0 (found {version!r})")
     if missing:
         raise RuntimeError(
             "Shape Completion requires " + RUSTCPD_REQUIREMENT
             + " with the constrained completion API. Missing or incompatible: "
             + ", ".join(missing)
-            + ". Install or upgrade to a supported released wheel, then restart Slicer "
-            "if an older rustcpd version was already imported."
+            + ". Install the released rustcpd==4.0.0 wheel, then restart Slicer "
+            "if a different rustcpd version was already imported."
         )
 
 
@@ -117,6 +112,12 @@ class MorphoWeaveShapeCompletionWidget(ShapeCompletionBatchMixin, _SingleComplet
         import slicer.packaging
 
         try:
+            loaded_rustcpd = sys.modules.get("rustcpd")
+            if loaded_rustcpd is not None and getattr(loaded_rustcpd, "__version__", None) != "4.0.0":
+                raise RuntimeError(
+                    "Shape Completion requires rustcpd==4.0.0. Another version is already "
+                    "loaded; restart Slicer before updating it. No packages were changed."
+                )
             slicer.packaging.pip_ensure(
                 [RUSTCPD_REQUIREMENT], prompt_install=True, requester="Shape Completion"
             )

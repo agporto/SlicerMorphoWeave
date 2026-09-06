@@ -586,7 +586,8 @@ class ShapeCompletionCoreUnitTest(unittest.TestCase):
         self.assertIn("meshwise_simultaneous_empirical_coverage", entry["held_out_mesh_audit"])
 
     def test_main_module_contains_required_ui_and_no_unconstrained_cpd(self):
-        source_path = MODULE_DIR / "MorphoWeaveShapeCompletion.py"
+        # The single-specimen UI moved into the base during Batch integration.
+        source_path = MODULE_DIR / "Resources" / "Python" / "MorphoWeaveShapeCompletionBase.py"
         source = source_path.read_text(encoding="utf-8")
         ast.parse(source, filename=str(source_path))
         self.assertIn("Target coverage:", source)

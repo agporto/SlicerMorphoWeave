@@ -1,11 +1,11 @@
 # Shape Completion integration validation
 
-The public Shape Completion widget accepts **`rustcpd>=3.1,<5`** for all
-entry points (startup, single completion, calibration, and batch). Stable 3.1+
-and 4.x releases must also pass constrained-completion API capability checks;
-prereleases and 5.x are not accepted. The public deployment preflight supersedes
-the historical preflight preserved in the base widget. Unsupported loaded
-extensions receive supported-release and Slicer-restart guidance.
+All registration installers use **`rustcpd==4.0.0`**: Landmark Transfer, the
+public Shape Completion widget and its base implementation. Imported native
+modules must report exactly `4.0.0`; older releases, later patches, local or
+post releases, and prereleases are rejected. Completion retains its required
+API checks. A different already loaded version is rejected before any pip
+operation, with instructions to restart Slicer.
 
 ## rustcpd 4.0 migration scope
 
@@ -21,12 +21,10 @@ regenerate calibration profiles with the backend used for production. Do not
 reuse a 3.1 calibration profile as evidence of calibrated 4.0 uncertainty.
 See the upstream [4.0 migration guide](https://github.com/agporto/rustcpd/blob/v4.0.0/docs/MIGRATING_4.md).
 
-**Remaining extension-wide constraint:** Landmark Transfer still declares
-`rustcpd>=3.0,<4` in its separate installer. This commit does not update that
-module. Running its installer can request a downgrade of an installed 4.x
-backend. Harmonize and test that dependency before approving extension-wide
-4.0 support or merging the combined extension. Acceptance by Shape Completion's
-public gate alone is not an extension-wide compatibility guarantee.
+Landmark Transfer and Shape Completion now share the exact dependency pin,
+so switching modules does not request conflicting backend versions. This
+dependency-policy change does not itself establish native numerical or live
+Slicer compatibility; the smoke-test gate below remains in place.
 
 Automatic SSM selection intentionally blocks signals in the base widget. The
 public widget explicitly mirrors the resulting model selections into Batch
@@ -41,15 +39,15 @@ From the repository root:
 python MorphoWeaveShapeCompletion/Testing/Python/ShapeCompletionIntegrationTest.py
 ```
 
-These 19 tests load the actual module entry point with interface doubles. They
+These tests load the actual module entry point with interface doubles. They
 exercise discarded signals, initial setup, reentry, partial/manual selection,
-3.1 and 4.0 version acceptance, unsupported versions, required capabilities,
+exact 4.0.0 acceptance, rejection of other versions, required capabilities,
 declined installs, failure, and retry. They are not a native fitter or live
 Qt/MRML validation.
 
 ## Native Slicer smoke test
 
-Install this branch of the extension and a compatible released rustcpd wheel,
+Install this branch of the extension and the released rustcpd==4.0.0 wheel,
 then run the following in a **fresh Slicer process** (replace `Slicer` with the
 path to the application executable). To validate 4.0 specifically, ensure the
 loaded backend is 4.0.0. The module paths must refer to this checkout or an

@@ -181,7 +181,7 @@ When an output directory is selected, the module also writes:
 
 ## Runtime dependency
 
-The module requires a compatible `rustcpd` build containing the pose-landmark-keypoints and completion APIs, including:
+The module requires exactly **`rustcpd==4.0.0`**, shared with Landmark Transfer, containing the pose-landmark-keypoints and completion APIs, including:
 
 - `pose_initialize(..., landmark_sigma=..., refine_landmark_sigma=..., with_scale=...)`;
 - `register_atlas(..., landmark_sigma=..., initial_*=...)`;

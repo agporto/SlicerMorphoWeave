@@ -236,10 +236,10 @@ class ShapeCompletionIntegrationTest(unittest.TestCase):
         self.widget.batch_ssm_table.setCurrentNode(value)
         self.assertIs(self.widget.ssm_table_selector.currentNode(), value)
 
-    def test_requires_supported_release_range_and_retains_cache(self):
+    def test_requires_exact_release_and_retains_cache(self):
         self.assertTrue(self.widget._ensure_dependencies())
         self.packaging.pip_ensure.assert_called_once_with(
-            ["rustcpd>=3.1,<5"], prompt_install=True, requester="Shape Completion")
+            ["rustcpd==4.0.0"], prompt_install=True, requester="Shape Completion")
         self.assertTrue(self.widget._ensure_dependencies())
         self.assertEqual(self.packaging.pip_ensure.call_count, 1)
 
@@ -259,11 +259,14 @@ class ShapeCompletionIntegrationTest(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     self.module.validate_completion_backend(self.backend)
 
-    def test_minor_post_and_local_versions_are_supported(self):
+    def test_only_exact_400_is_accepted(self):
+        self.module.validate_completion_backend(self.backend)
         for version in ("3.1.0", "3.2.1", "3.1.0.post1", "3.1.0+local",
-                        "4.0.0", "4.1.2", "4.0.0.post1", "4.0.0+local"):
-            self.backend.__version__ = version
-            self.module.validate_completion_backend(self.backend)
+                        "4.0.1", "4.1.2", "4.0.0.post1", "4.0.0+local", None):
+            with self.subTest(version=version):
+                self.backend.__version__ = version
+                with self.assertRaises(RuntimeError):
+                    self.module.validate_completion_backend(self.backend)
 
     def test_released_400_passes_public_preflight(self):
         self.backend.__version__ = "4.0.0"
@@ -271,10 +274,18 @@ class ShapeCompletionIntegrationTest(unittest.TestCase):
         self.slicer.util.errorDisplay.assert_not_called()
         self.assertTrue(self.widget._deps_ready)
 
-    def test_31_is_still_accepted_for_existing_environments(self):
+    def test_31_is_rejected_for_existing_environments(self):
         self.backend.__version__ = "3.1.0"
-        self.assertTrue(self.widget._ensure_dependencies())
-        self.slicer.util.errorDisplay.assert_not_called()
+        self.assertFalse(self.widget._ensure_dependencies())
+        self.assertFalse(self.widget._deps_ready)
+        self.assertIn("rustcpd==4.0.0", self.slicer.util.errorDisplay.call_args.args[0])
+
+    def test_wrong_loaded_version_is_rejected_before_pip(self):
+        loaded = types.SimpleNamespace(__version__="3.1.0")
+        with patch.dict(sys.modules, {"rustcpd": loaded}):
+            self.assertFalse(self.widget._ensure_dependencies())
+        self.packaging.pip_ensure.assert_not_called()
+        self.assertIn("restart Slicer", self.slicer.util.errorDisplay.call_args.args[0])
 
     def test_400_with_missing_posterior_api_is_not_accepted(self):
         self.backend.__version__ = "4.0.0"

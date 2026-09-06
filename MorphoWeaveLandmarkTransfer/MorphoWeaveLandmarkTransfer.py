@@ -183,7 +183,14 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
     import slicer.packaging
     import sys
 
-    requirements = ["tiny3d-rs>=2.1,<3", "rustcpd>=3.0,<4"]
+    requirements = ["tiny3d-rs>=2.1,<3", "rustcpd==4.0.0"]
+    loaded_rustcpd = sys.modules.get("rustcpd")
+    if loaded_rustcpd is not None and getattr(loaded_rustcpd, "__version__", None) != "4.0.0":
+      slicer.util.infoDisplay(
+        "Landmark Transfer requires rustcpd==4.0.0. Another rustcpd version is "
+        "already loaded; restart Slicer before updating it. No packages were changed."
+      )
+      return False
     legacy_tiny3d_installed = slicer.packaging.pip_check("tiny3d")
 
     # The legacy and Rust distributions both own the tiny3d import package.
@@ -202,7 +209,7 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
 
     if legacy_tiny3d_installed and not slicer.util.confirmOkCancelDisplay(
       "Landmark Transfer must remove the legacy tiny3d distribution and "
-      "install tiny3d-rs>=2.1,<3 and rustcpd>=3.0,<4.\n\nContinue?"
+      "install tiny3d-rs>=2.1,<3 and rustcpd==4.0.0.\n\nContinue?"
     ):
       slicer.util.showStatusMessage("Landmark Transfer dependencies were not changed.", 3000)
       return False
@@ -218,7 +225,12 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
       )
       importlib.invalidate_caches()
       for module_name in ("tiny3d", "rustcpd", "scipy.spatial", "scipy.optimize"):
-        importlib.import_module(module_name)
+        module = importlib.import_module(module_name)
+        if module_name == "rustcpd" and getattr(module, "__version__", None) != "4.0.0":
+          raise RuntimeError(
+            "Landmark Transfer requires rustcpd==4.0.0. Install that release and "
+            "restart Slicer before running registration."
+          )
     except Exception as error:
       if isinstance(error, RuntimeError) and str(error) == "User declined package installation":
         slicer.util.showStatusMessage("Landmark Transfer dependencies were not installed.", 3000)
