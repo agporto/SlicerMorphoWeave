@@ -10,11 +10,13 @@ set(MODULE_PYTHON_RESOURCES
   README.md
   TUTORIAL.md
   BATCH.md
+  MERGE_VALIDATION.md
   Resources/Icons/${MODULE_NAME}.png
   Resources/Python/MorphoWeaveShapeCompletionCore.py
   Resources/Python/MorphoWeaveShapeCompletionBase.py
   Resources/Python/MorphoWeaveShapeCompletionBatch.py
   Resources/Python/MorphoWeaveCompletionBatch.py
+  Testing/Python/ShapeCompletionSlicerSmokeTest.py
   )
 
 #-----------------------------------------------------------------------------
@@ -32,4 +34,5 @@ if(BUILD_TESTING)
   slicer_add_python_unittest(SCRIPT Testing/Python/ShapeCompletionModuleSourceTest.py)
   slicer_add_python_unittest(SCRIPT Testing/Python/BatchRunnerTest.py)
   slicer_add_python_unittest(SCRIPT Testing/Python/BatchTabTest.py)
+  slicer_add_python_unittest(SCRIPT Testing/Python/ShapeCompletionIntegrationTest.py)
 endif()
