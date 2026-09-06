@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -79,6 +80,7 @@ class MorphoWeaveSurfaceSegmentationWidget(ScriptedLoadableModuleWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.logic = None
+        self._running = False
 
     def setup(self):
         super().setup()
@@ -145,6 +147,10 @@ class MorphoWeaveSurfaceSegmentationWidget(ScriptedLoadableModuleWidget):
         requiredForm.addRow("Dense correspondences folder:", self.mrkDir)
         requiredForm.addRow("Reference correspondences (optional):", self.referencePath)
         requiredForm.addRow("Output folder:", self.outDir)
+        self.outDir.setToolTip(
+            "Each run creates a new subfolder here. Previous runs and unrelated files "
+            "are never overwritten or mixed with the new segmentation."
+        )
 
         backend = ctk.ctkCollapsibleButton()
         backend.text = "hdmseg Backend"
@@ -243,9 +249,25 @@ class MorphoWeaveSurfaceSegmentationWidget(ScriptedLoadableModuleWidget):
 
     def _selectionChanged(self, *_):
         mode = self._selectionMode()
-        self.fixedK.enabled = mode == "fixed"
-        self.maxK.enabled = mode != "fixed"
-        self.bootstraps.enabled = mode == "stability"
+        self.fixedK.enabled = not self._running and mode == "fixed"
+        self.maxK.enabled = not self._running and mode != "fixed"
+        self.bootstraps.enabled = not self._running and mode == "stability"
+
+    def _setRunning(self, running):
+        """Prevent reentry, including while dependency installation pumps events."""
+        self._running = bool(running)
+        for widget in (
+            self.meshDir, self.mrkDir, self.referencePath, self.outDir,
+            self.selection, self.fixedK, self.maxK, self.neighbors,
+            self.components, self.bootstraps, self.seed, self.parallel,
+            self.smoothing, self.writeVtp, self.writePly, self.previewN,
+            self.installButton,
+        ):
+            widget.enabled = not self._running
+        self.runButton.enabled = False
+        if not self._running:
+            self._selectionChanged()
+            self._validateInputs()
 
     def _installedVersion(self):
         try:
@@ -307,10 +329,19 @@ class MorphoWeaveSurfaceSegmentationWidget(ScriptedLoadableModuleWidget):
         return module
 
     def _installBackend(self):
-        if self._ensureBackend() is not None:
-            slicer.util.showStatusMessage("Surface Segmentation: hdmseg ready", 3000)
+        if self._running:
+            return
+        self._setRunning(True)
+        try:
+            if self._ensureBackend() is not None:
+                slicer.util.showStatusMessage("Surface Segmentation: hdmseg ready", 3000)
+        finally:
+            self._setRunning(False)
 
     def _validateInputs(self, *_):
+        if self._running:
+            self.runButton.enabled = False
+            return
         meshDir, mrkDir, outDir = map(
             self._path, (self.meshDir, self.mrkDir, self.outDir)
         )
@@ -349,12 +380,14 @@ class MorphoWeaveSurfaceSegmentationWidget(ScriptedLoadableModuleWidget):
             )
 
     def onRun(self):
-        backend = self._ensureBackend()
-        if backend is None:
+        if self._running:
             return
-        self.runButton.enabled = False
+        self._setRunning(True)
         result = None
         try:
+            backend = self._ensureBackend()
+            if backend is None:
+                return
             with slicer.util.tryWithErrorDisplay(
                 "Surface Segmentation failed", waitCursor=True
             ):
@@ -378,9 +411,8 @@ class MorphoWeaveSurfaceSegmentationWidget(ScriptedLoadableModuleWidget):
                     previewN=int(self._value(self.previewN)),
                 )
         finally:
-            self.runButton.enabled = True
+            self._setRunning(False)
         if result is None:
-            self._validateInputs()
             return
         message = (
             f"Surface Segmentation: {result['specimens']} specimens, "
@@ -391,7 +423,7 @@ class MorphoWeaveSurfaceSegmentationWidget(ScriptedLoadableModuleWidget):
         if result["skipped"]:
             message += f", {result['skipped']} mesh exports skipped"
         slicer.util.showStatusMessage(message, 8000)
-        setWorkflowStatus(self.status, "complete", f"Results written to {self._path(self.outDir)}")
+        setWorkflowStatus(self.status, "complete", f"Results written to {result['output_directory']}")
 
 
 class MorphoWeaveSurfaceSegmentationLogic(ScriptedLoadableModuleLogic):
@@ -420,8 +452,8 @@ class MorphoWeaveSurfaceSegmentationLogic(ScriptedLoadableModuleLogic):
         if not callable(getattr(hdmseg, "segment", None)):
             raise RuntimeError("The loaded hdmseg module does not provide segment().")
 
-        output = Path(outDir).expanduser().resolve()
-        output.mkdir(parents=True, exist_ok=True)
+        outputRoot = Path(outDir).expanduser().resolve()
+        outputRoot.mkdir(parents=True, exist_ok=True)
         self._clearPreviews()
         pairs = self.pairFiles(meshesDir, mrkDir)
         if not pairs:
@@ -474,6 +506,12 @@ class MorphoWeaveSurfaceSegmentationLogic(ScriptedLoadableModuleLogic):
 
         embedding = np.asarray(result.embedding, dtype=np.float64)
         eigenvalues = np.asarray(result.eigenvalues, dtype=np.float64)
+        # Exclusive directory creation isolates reruns even when they start in
+        # the same second. Never delete or reuse an earlier run's region files.
+        output = Path(tempfile.mkdtemp(
+            prefix="MorphoWeaveSurfaceSegmentation_" + time.strftime("%Y%m%d_%H%M%S") + "_",
+            dir=str(outputRoot),
+        ))
         self._writeLocusOutputs(output, labels, embedding, eigenvalues)
 
         vtkFiles, plyFiles, skipped = [], [], []
@@ -554,6 +592,7 @@ class MorphoWeaveSurfaceSegmentationLogic(ScriptedLoadableModuleLogic):
             "stability": stability,
             "skipped": len(skipped),
             "summary": str(summaryPath),
+            "output_directory": str(output),
         }
 
     @staticmethod

@@ -7,7 +7,9 @@ set(MODULE_PYTHON_SCRIPTS
   )
 
 set(MODULE_PYTHON_RESOURCES
+  README.md
   Resources/Icons/${MODULE_NAME}.png
+  Testing/Python/SurfaceSegmentationSlicerSmokeTest.py
   )
 
 #-----------------------------------------------------------------------------
@@ -22,4 +24,5 @@ slicerMacroBuildScriptedModule(
 if(BUILD_TESTING)
   slicer_add_python_unittest(SCRIPT ${MODULE_NAME}.py)
   slicer_add_python_unittest(SCRIPT Testing/Python/SurfaceSegmentationSourceTest.py)
+  slicer_add_python_unittest(SCRIPT Testing/Python/SurfaceSegmentationWorkflowTest.py)
 endif()
