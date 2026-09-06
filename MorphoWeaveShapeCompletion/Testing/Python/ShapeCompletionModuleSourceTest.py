@@ -4,12 +4,14 @@ import unittest
 from pathlib import Path
 
 MODULE_DIR = Path(__file__).resolve().parents[2]
-MODULE = MODULE_DIR / "MorphoWeaveShapeCompletion.py"
+ENTRYPOINT = MODULE_DIR / "MorphoWeaveShapeCompletion.py"
+MODULE = MODULE_DIR / "Resources" / "Python" / "MorphoWeaveShapeCompletionBase.py"
 CORE = MODULE_DIR / "Resources" / "Python" / "MorphoWeaveShapeCompletionCore.py"
 
 
 class ShapeCompletionModuleSourceTest(unittest.TestCase):
     def test_python_sources_parse(self):
+        ast.parse(ENTRYPOINT.read_text(encoding="utf-8"), filename=str(ENTRYPOINT))
         ast.parse(MODULE.read_text(encoding="utf-8"), filename=str(MODULE))
         ast.parse(CORE.read_text(encoding="utf-8"), filename=str(CORE))
 
