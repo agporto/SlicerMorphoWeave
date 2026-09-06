@@ -199,8 +199,9 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
         intro = qt.QLabel(
             "Pipeline: deterministic global pose search → refinement of surviving poses → "
             "pure SSM atlas registration → conditional posterior completion. No unconstrained "
-            "fine deformation is applied. Based on the current fragment experiments, homologous "
-            "landmarks are recommended below 0.75 target coverage."
+            "fine deformation is applied. Off-centre fragments (e.g. the end third of a long bone) "
+            "are handled by translation seeding in the pose search (Advanced tab); homologous "
+            "landmarks are still recommended below 0.75 target coverage."
         )
         intro.setWordWrap(True)
         complete_layout.addRow(intro)
@@ -441,16 +442,36 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
         )
         self.coverage_prescale_check.checked = True
         self.coverage_prescale_check.setToolTip(
-            "For partial targets, estimate full linear extent as fragment extent / coverage, "
-            "then fix residual scale during pose and atlas optimization. Disable when source and target are already in the same physical scale."
+            "For partial targets, pre-scale the SSM so that a fragment of the given coverage cut "
+            "from it has the target's size (median over many cut directions); the spread of those "
+            "cuts also bounds the residual scale. Disable when source and target are already in the "
+            "same physical scale."
         )
         form.addRow(self.coverage_prescale_check)
         self.scale_policy_combo = qt.QComboBox()
         self.scale_policy_combo.addItems(
-            ["Automatic (free at 1.0; fixed for fragments)", "Always free", "Always fixed"]
+            ["Automatic (free; bounded for fragments)", "Always free", "Always fixed"]
         )
-        self.scale_policy_combo.setCurrentIndex(1)
+        self.scale_policy_combo.setCurrentIndex(0)
+        self.scale_policy_combo.setToolTip(
+            "Automatic keeps the residual scale free but, for fragments, bounded to the range "
+            "of scales a fragment of this coverage can have anywhere on the SSM (widened by the "
+            "margin below). An unbounded free scale lets the SSM shrink into the fragment and "
+            "disables translation seeding; a fixed scale trusts the pre-scale guess exactly."
+        )
         form.addRow("Residual scale policy:", self.scale_policy_combo)
+        self.free_scale_bounds = ctk.ctkDoubleSpinBox()
+        self.free_scale_bounds.minimum = 0.0
+        self.free_scale_bounds.maximum = 0.9
+        self.free_scale_bounds.singleStep = 0.05
+        self.free_scale_bounds.value = 0.15
+        self.free_scale_bounds.setDecimals(2)
+        self.free_scale_bounds.value = 0.10
+        self.free_scale_bounds.setToolTip(
+            "Extra margin added on each side of the coverage-consistent scale range for fragments "
+            "(0 disables bounding). Complete targets are never bounded."
+        )
+        form.addRow("Fragment scale-bound margin (±):", self.free_scale_bounds)
         self.landmark_sigma_percent = ctk.ctkDoubleSpinBox()
         self.landmark_sigma_percent.minimum = 0.05
         self.landmark_sigma_percent.maximum = 25.0
@@ -497,6 +518,46 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
         pose.addRow("Pose SSM regularization:", self.pose_lambda)
         pose.addRow("Pose outlier weight:", self.pose_outlier)
         pose.addRow("Identity prior probability:", self.pose_identity_prior)
+
+        seeding_box = ctk.ctkCollapsibleButton()
+        seeding_box.text = "Partial-Target Pose Seeding"
+        seeding_box.collapsed = False
+        seeding = qt.QFormLayout(seeding_box)
+        layout.addRow(seeding_box)
+        seeding_intro = qt.QLabel(
+            "Every rotation hypothesis is seeded with the SSM centroid on the fragment centroid, "
+            "which is wrong for fragments away from the centre (an end third of a long bone). "
+            "Extra seeds place fragment-sized local centroids of the SSM on the fragment instead. "
+            "They are only used below 0.95 coverage and only when the residual scale is fixed or bounded."
+        )
+        seeding_intro.setWordWrap(True)
+        seeding.addRow(seeding_intro)
+        self.pose_anchor_count = self._spin(1, 32, 6)
+        self.pose_anchor_count.setToolTip(
+            "Translation seeds per rotation. 1 reproduces the classic centroid seed. Coarse-stage cost scales with this value; refinement cost does not."
+        )
+        seeding.addRow("Translation seeds per rotation:", self.pose_anchor_count)
+        self.pose_anchor_threshold = self._double(0.5, 1.0, 0.9, 0.05, 2)
+        self.pose_anchor_threshold.setToolTip(
+            "rustcpd adds seeds only when the fragment's RMS radius is below this fraction of the SSM's (in the pose frame)."
+        )
+        seeding.addRow("Completeness threshold:", self.pose_anchor_threshold)
+        self.pose_adaptive_mixing = self._double(0.0, 100.0, 0.0, 0.5, 2)
+        self.pose_adaptive_mixing.setToolTip(
+            "Adaptive per-point mixing proportions (Dirichlet floor α). SSM points with no supporting fragment data switch off during pose and atlas EM. 0 keeps classic uniform mixing."
+        )
+        seeding.addRow("Adaptive mixing α (0 = off):", self.pose_adaptive_mixing)
+        self.pose_initial_sigma2 = self._double(0.0, 2.0, 0.0, 0.05, 2)
+        self.pose_initial_sigma2.setToolTip(
+            "Starting variance of the pose EM in rustcpd's normalized frame (fragment RMS radius = 1). "
+            "0 = automatic: the whole-model estimate, or 0.25 when seeding activates."
+        )
+        seeding.addRow("Pose initial σ² (0 = auto):", self.pose_initial_sigma2)
+        self.pose_merge_tolerance = self._double(0.0, 0.2, 0.02, 0.005, 3)
+        self.pose_merge_tolerance.setToolTip(
+            "Refined pose starts whose fitted SSMs agree within this fraction of the fragment RMS radius are one solution in the ambiguity diagnostics."
+        )
+        seeding.addRow("Hypothesis merge tolerance:", self.pose_merge_tolerance)
 
         atlas_box = ctk.ctkCollapsibleButton()
         atlas_box.text = "Pure Atlas Registration"
@@ -824,6 +885,9 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
         policy = {0: "auto", 1: "free", 2: "fixed"}[policy_index]
         refine_source = int(self.pose_refine_source.value)
         atlas_k = int(self.atlas_k.value)
+        bounds_fraction = float(self.free_scale_bounds.value)
+        mixing_alpha = float(self.pose_adaptive_mixing.value)
+        initial_sigma2 = float(self.pose_initial_sigma2.value)
         return CompletionSettings(
             coverage=float(self.coverage_spin.value if coverage is None else coverage),
             variance_keep=float(self.variance_keep.value),
@@ -857,6 +921,12 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
             posterior_samples=int(self.posterior_samples.value if samples is None else samples),
             seed=int(self.random_seed.value),
             parallel=bool(self.parallel_check.checked),
+            translation_anchor_count=int(self.pose_anchor_count.value),
+            anchor_completeness_threshold=float(self.pose_anchor_threshold.value),
+            free_scale_bounds_fraction=None if bounds_fraction <= 0.0 else bounds_fraction,
+            adaptive_mixing=None if mixing_alpha <= 0.0 else mixing_alpha,
+            initial_sigma2=None if initial_sigma2 <= 0.0 else initial_sigma2,
+            merge_tolerance=float(self.pose_merge_tolerance.value),
         )
 
     def _settings_snapshot(self, settings):
@@ -872,11 +942,11 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
         import slicer.packaging
 
         try:
-            loaded_rustcpd = sys.modules.get("rustcpd")
-            if loaded_rustcpd is not None and getattr(loaded_rustcpd, "__version__", None) != "4.0.0":
+            loaded = sys.modules.get("rustcpd")
+            if loaded is not None and getattr(loaded, "__version__", None) != "4.0.0":
                 raise RuntimeError(
-                    "Shape Completion requires rustcpd==4.0.0. Another version is already "
-                    "loaded; restart Slicer before updating it. No packages were changed."
+                    "Shape Completion requires rustcpd==4.0.0. Restart Slicer before "
+                    "replacing an already loaded backend. No packages were changed."
                 )
             slicer.packaging.pip_ensure(
                 ["rustcpd==4.0.0"],
@@ -886,10 +956,7 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
             importlib.invalidate_caches()
             rustcpd = importlib.import_module("rustcpd")
             if getattr(rustcpd, "__version__", None) != "4.0.0":
-                raise RuntimeError(
-                    "Shape Completion requires rustcpd==4.0.0. Install that release "
-                    "and restart Slicer before running completion."
-                )
+                raise RuntimeError("Install rustcpd==4.0.0 and restart Slicer.")
             pose_parameters = inspect.signature(rustcpd.pose_initialize).parameters
             atlas_parameters = inspect.signature(rustcpd.register_atlas).parameters
             missing = []
@@ -917,6 +984,12 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
                 "seed",
                 "parallel",
                 "single_precision",
+                "translation_anchor_count",
+                "anchor_completeness_threshold",
+                "scale_bounds",
+                "adaptive_mixing",
+                "initial_sigma2",
+                "merge_tolerance",
             )
             atlas_required = (
                 "lambda_regularization",
@@ -936,6 +1009,8 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
                 "k",
                 "parallel",
                 "single_precision",
+                "scale_bounds",
+                "adaptive_mixing",
             )
             for name in pose_required:
                 if name not in pose_parameters:
@@ -959,6 +1034,9 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
                     "effective_hypotheses",
                     "hypotheses_evaluated",
                     "hypotheses_refined",
+                    "distinct_hypotheses",
+                    "winner_support",
+                    "translation_anchors_used",
                 ):
                     if not hasattr(rustcpd.PoseInitialization, name):
                         missing.append(f"PoseInitialization.{name}")
@@ -973,6 +1051,7 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
                     "iterations",
                     "difference",
                     "landmark_rms",
+                    "mixing_weights",
                     "posterior",
                 ):
                     if not hasattr(rustcpd.AtlasResult, name):
@@ -1002,10 +1081,9 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
                         missing.append(f"ShapePosterior.{name}")
             if missing:
                 raise RuntimeError(
-                    "The installed rustcpd build lacks the constrained shape-completion API: "
+                    "The installed rustcpd build lacks the partial-target shape-completion API: "
                     + ", ".join(missing)
-                    + ". Install the released rustcpd==4.0.0 wheel with the "
-                    "pose-landmark-keypoints functionality, then restart Slicer."
+                    + ". Install the released rustcpd==4.0.0 wheel, then restart Slicer."
                 )
             self._deps_ready = True
             return True
@@ -2466,10 +2544,27 @@ class MorphoWeaveShapeCompletionLogic(ScriptedLoadableModuleLogic):
         lines.extend(
             [
                 "",
-                "Pose ambiguity diagnostics (within this run only)",
-                f"  score margin: {diagnostics['pose_score_margin_within_run_only']:.6g}",
-                f"  entropy: {diagnostics['pose_posterior_entropy_within_run_only']:.6g}",
-                f"  effective hypotheses: {diagnostics['pose_effective_hypotheses_within_run_only']:.3f}",
+                "Pose search (within this run only)",
+                f"  translation seeds per rotation: requested {diagnostics.get('pose_translation_anchors_requested', 1)}, "
+                f"used {diagnostics.get('pose_translation_anchors_used') if diagnostics.get('pose_translation_anchors_used') is not None else 'n/a'}",
+                f"  hypotheses: {diagnostics['pose_hypotheses_evaluated']} evaluated, "
+                f"{diagnostics['pose_hypotheses_refined']} refined, "
+                f"{diagnostics.get('pose_distinct_hypotheses') if diagnostics.get('pose_distinct_hypotheses') is not None else 'n/a'} distinct after merging",
+                f"  refined starts agreeing with the winner: {diagnostics.get('pose_winner_support') if diagnostics.get('pose_winner_support') is not None else 'n/a'}",
+                f"  score margin to best different solution: {diagnostics['pose_score_margin_within_run_only']:.6g}",
+                f"  entropy over distinct solutions: {diagnostics['pose_posterior_entropy_within_run_only']:.6g}",
+                f"  effective distinct hypotheses: {diagnostics['pose_effective_hypotheses_within_run_only']:.3f} (≈1 = unambiguous)",
+            ]
+        )
+        if diagnostics.get("pose_seeding_warning"):
+            lines.append("  warning: " + str(diagnostics["pose_seeding_warning"]))
+        if diagnostics.get("atlas_mixing_effective_points") is not None:
+            lines.append(
+                f"  adaptive mixing: {diagnostics['atlas_mixing_effective_points']:.0f} effective SSM points "
+                f"(weights {diagnostics['atlas_mixing_weight_min']:.2e}–{diagnostics['atlas_mixing_weight_max']:.2e})"
+            )
+        lines.extend(
+            [
                 "",
                 f"Calibration: {diagnostics['calibration_message']}",
                 f"Uncertainty scope: {diagnostics['uncertainty_scope']}",

@@ -75,6 +75,34 @@ class CompletionSettings:
     seed: int = 0
     parallel: bool = True
     single_precision: bool = False
+    # Partial-target pose seeding (rustcpd >= 3.2). Translation seeds per
+    # rotation: 1 reproduces the classic centroid seed; larger values add
+    # fragment-sized local centroids of the SSM mean so an end fragment can
+    # start at the right end. rustcpd only activates the extra seeds when the
+    # target is smaller than the (scale-constrained) model, and this module
+    # additionally forces a single seed at coverage >= 0.95.
+    translation_anchor_count: int = 6
+    anchor_completeness_threshold: float = 0.9
+    # Extra relative margin on each side of the coverage-consistent scale
+    # range used to bound the residual scale of fragments (see
+    # coverage_scale_candidates). None leaves the scale unbounded, which lets
+    # the model shrink into the fragment and disables translation seeding.
+    free_scale_bounds_fraction: Optional[float] = 0.10
+    # Dirichlet floor of adaptive per-point mixing proportions; None = classic CPD.
+    adaptive_mixing: Optional[float] = None
+    # Starting variance for the pose EM in rustcpd's normalized frame; None =
+    # automatic (whole-model estimate, or 0.25 when seeding activates).
+    initial_sigma2: Optional[float] = None
+    # Refined pose starts whose fitted models agree within this fraction of the
+    # target RMS radius count as one solution in the ambiguity diagnostics.
+    merge_tolerance: float = 0.02
+    # The atlas stage inherits the pose-search result; start its variance from
+    # that pose's own residual (this factor times the mean squared nearest-
+    # neighbour distance from fragment to posed SSM) instead of rustcpd's
+    # whole-model estimate, which is hundreds of times too soft for a fragment
+    # and lets the first EM steps re-centre the SSM on the fragment, undoing
+    # the pose search. None restores the classic estimate.
+    atlas_sigma2_from_pose_factor: Optional[float] = 2.0
 
     def validate(self) -> None:
         if not 0.05 <= float(self.coverage) <= 1.0:
@@ -119,13 +147,77 @@ class CompletionSettings:
             raise ValueError("atlas_k must be positive or None")
         if int(self.posterior_samples) < 0:
             raise ValueError("posterior_samples cannot be negative")
+        if int(self.translation_anchor_count) < 1:
+            raise ValueError("translation_anchor_count must be at least 1")
+        if not 0.0 < float(self.anchor_completeness_threshold) <= 1.0:
+            raise ValueError("anchor_completeness_threshold must be in (0, 1]")
+        if self.free_scale_bounds_fraction is not None and not (
+            0.0 < float(self.free_scale_bounds_fraction) < 1.0
+        ):
+            raise ValueError("free_scale_bounds_fraction must be in (0, 1) or None")
+        if self.adaptive_mixing is not None and not float(self.adaptive_mixing) >= 0.0:
+            raise ValueError("adaptive_mixing must be non-negative or None")
+        if self.initial_sigma2 is not None and not float(self.initial_sigma2) > 0.0:
+            raise ValueError("initial_sigma2 must be positive or None")
+        if float(self.merge_tolerance) < 0.0:
+            raise ValueError("merge_tolerance cannot be negative")
+        if self.atlas_sigma2_from_pose_factor is not None and not (
+            float(self.atlas_sigma2_from_pose_factor) > 0.0
+        ):
+            raise ValueError("atlas_sigma2_from_pose_factor must be positive or None")
+
+    def is_fragment(self) -> bool:
+        return float(self.coverage) < 0.95
+
+    def effective_anchor_count(self) -> int:
+        """Translation seeds actually requested from rustcpd.
+
+        Complete or near-complete targets never pay the seeding cost: the
+        classic centroid seed is exactly right for them.
+        """
+        return int(self.translation_anchor_count) if self.is_fragment() else 1
+
+    def scale_bounds(
+        self, relative_candidates: Optional[np.ndarray] = None
+    ) -> Optional[tuple[float, float]]:
+        """Residual-scale interval forwarded to rustcpd, or None.
+
+        Only meaningful when the residual scale is free, and only applied to
+        fragments; complete targets stay unbounded. The interval spans the
+        coverage-consistent scale candidates (relative to the applied
+        pre-scale, see :func:`coverage_scale_candidates`) widened by
+        `free_scale_bounds_fraction` on each side. Without candidates (pre-scale
+        disabled) it is `1 ± fraction`. It keeps the closed-form scale from
+        shrinking the whole model into the fragment, which would also disable
+        translation seeding.
+        """
+        if not self.with_scale() or not self.is_fragment():
+            return None
+        if self.free_scale_bounds_fraction is None:
+            return None
+        fraction = float(self.free_scale_bounds_fraction)
+        low, high = 1.0, 1.0
+        if relative_candidates is not None and len(relative_candidates):
+            values = np.asarray(relative_candidates, dtype=np.float64)
+            low = float(np.min(values))
+            high = float(np.max(values))
+        return (low * (1.0 - fraction), high / (1.0 - fraction))
 
     def with_scale(self) -> bool:
+        """Whether the residual similarity scale is optimized.
+
+        `auto` keeps the scale free. For fragments it is free *within bounds*
+        derived from the coverage-consistent pre-scale (see
+        :meth:`scale_bounds`): a third of a bone can be the thin shaft or the
+        bulky head, and only the pose search can tell which, so pinning the
+        scale at a single pre-scale guess is fragile. `fixed` pins it at 1 in
+        the pre-scaled frame.
+        """
         if self.residual_scale_policy == "free":
             return True
         if self.residual_scale_policy == "fixed":
             return False
-        return bool(np.isclose(float(self.coverage), 1.0))
+        return True
 
 
 @dataclass(frozen=True)
@@ -154,6 +246,8 @@ class CompletionResult:
     target_centroid: np.ndarray
     retained_modes: int
     retained_variance: float
+    scale_bounds: Optional[tuple[float, float]] = None
+    atlas_initial_sigma2: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -662,13 +756,82 @@ def coordinate_compatibility(
     }
 
 
-def coverage_prescale(mean: np.ndarray, target: np.ndarray, coverage: float) -> float:
-    source_diagonal = bbox_diagonal(mean)
-    target_diagonal = bbox_diagonal(target)
+def _fibonacci_directions(count: int) -> np.ndarray:
+    index = np.arange(count, dtype=np.float64) + 0.5
+    z = 1.0 - 2.0 * index / count
+    radius = np.sqrt(np.maximum(0.0, 1.0 - z * z))
+    golden = np.pi * (3.0 - np.sqrt(5.0))
+    return np.column_stack((radius * np.cos(golden * index), radius * np.sin(golden * index), z))
+
+
+def coverage_scale_candidates(
+    mean: np.ndarray,
+    target: np.ndarray,
+    coverage: float,
+    *,
+    directions: int = 32,
+    shape_keep: float = 0.25,
+) -> np.ndarray:
+    """Scale factors consistent with the fragment being a `coverage` cut of the model.
+
+    Coverage is a fraction of surface points (the calibration generator keeps
+    that fraction on one side of a random plane), so a linear-extent rule such
+    as `diagonal(fragment) / coverage / diagonal(model)` is not consistent with
+    it: a chunky proximal end has a far larger diagonal than a third of the
+    bone's and would inflate the model by 50 % or more. Instead the model is cut
+    by planes in `directions` deterministic directions (both sides), each cut
+    keeping the same point fraction as the fragment, and the fragment's RMS
+    radius is compared with every sub-region's. The median is a robust
+    pre-scale; the min/max span the scales a fragment of this coverage can have
+    depending on *where* on the model it lies, which is exactly the ambiguity
+    the pose search must resolve.
+    """
+    mean = _points(mean, "mean")
+    target = _points(target, "target")
     coverage = float(np.clip(coverage, 1e-3, 1.0))
-    if source_diagonal <= _TINY:
-        return 1.0
-    return float((target_diagonal / coverage) / source_diagonal)
+    target_radius = rms_radius(target)
+    if target_radius <= _TINY:
+        return np.ones(1)
+    if coverage >= 1.0 - 1e-9:
+        return np.array([target_radius / max(rms_radius(mean), _TINY)])
+    count = max(3, min(len(mean), int(round(coverage * len(mean)))))
+    # Only sub-regions that *look like* the fragment vote on its scale. A
+    # longitudinal strip of a long bone is a legitimate 33 % cut but has a
+    # totally different (scale-free) covariance spectrum from a transverse
+    # third; letting its size in would allow the model to shrink into the
+    # fragment. Keep the best-matching `shape_keep` fraction of cuts.
+    target_shape = _shape_spectrum(target)
+    scales = []
+    distances = []
+    for normal in _fibonacci_directions(int(directions)):
+        projection = mean @ normal
+        order = np.argsort(projection, kind="mergesort")
+        for indices in (order[:count], order[-count:]):
+            region = mean[indices]
+            radius = rms_radius(region)
+            if radius <= _TINY:
+                continue
+            scales.append(target_radius / radius)
+            distances.append(float(np.linalg.norm(_shape_spectrum(region) - target_shape)))
+    if not scales:
+        return np.ones(1)
+    scales = np.asarray(scales, dtype=np.float64)
+    distances = np.asarray(distances, dtype=np.float64)
+    keep = max(3, int(round(shape_keep * len(scales))))
+    return scales[np.argsort(distances, kind="mergesort")[:keep]]
+
+
+def _shape_spectrum(points: np.ndarray) -> np.ndarray:
+    """Scale-free shape descriptor: log ratios of covariance eigenvalues."""
+    centered = np.asarray(points, dtype=np.float64) - np.mean(points, axis=0)
+    eigenvalues = np.sort(np.linalg.eigvalsh(centered.T @ centered / max(len(points), 1)))[::-1]
+    leading = max(float(eigenvalues[0]), _TINY)
+    return np.log(np.maximum(eigenvalues[1:], _TINY) / leading)
+
+
+def coverage_prescale(mean: np.ndarray, target: np.ndarray, coverage: float) -> float:
+    """Median coverage-consistent scale; see :func:`coverage_scale_candidates`."""
+    return float(np.median(coverage_scale_candidates(mean, target, coverage)))
 
 
 def run_completion(
@@ -690,13 +853,17 @@ def run_completion(
     source_centroid = ssm.mean.mean(axis=0, keepdims=True)
     target_centroid = target.mean(axis=0, keepdims=True)
     source_scale = 1.0
+    relative_candidates = None
     if settings.coverage < 1.0 and settings.coverage_prescale:
-        source_scale = coverage_prescale(ssm.mean, target, settings.coverage)
+        candidates = coverage_scale_candidates(ssm.mean, target, settings.coverage)
+        source_scale = float(np.median(candidates))
+        relative_candidates = candidates / max(source_scale, _TINY)
     working_mean = (ssm.mean - source_centroid) * source_scale
     working_modes = ssm.modes * source_scale
     working_modes_flat = working_modes.reshape(working_mean.size, ssm.retained_modes)
     working_target = target - target_centroid
     with_scale = settings.with_scale()
+    scale_bounds = settings.scale_bounds(relative_candidates)
 
     if settings.use_landmarks and landmarks is None:
         raise ValueError("landmark mode was requested but no matched landmarks were supplied")
@@ -758,6 +925,15 @@ def run_completion(
         "seed": int(settings.seed),
         "parallel": bool(settings.parallel),
         "single_precision": bool(settings.single_precision),
+        # Partial-target seeding. rustcpd falls back to the single centroid
+        # seed on its own when the target looks complete or the scale is
+        # unconstrained; effective_anchor_count() adds the coverage gate.
+        "translation_anchor_count": int(settings.effective_anchor_count()),
+        "anchor_completeness_threshold": float(settings.anchor_completeness_threshold),
+        "scale_bounds": scale_bounds,
+        "adaptive_mixing": settings.adaptive_mixing,
+        "initial_sigma2": settings.initial_sigma2,
+        "merge_tolerance": float(settings.merge_tolerance),
     }
     if use_landmarks:
         pose_kwargs.update(
@@ -774,7 +950,25 @@ def run_completion(
         **pose_kwargs,
     )
 
+    # Continue the annealing where the pose search left it. rustcpd's default
+    # initializer measures the spread of the *whole* model against the target;
+    # for a fragment that is far too soft and the first M-steps pull the model
+    # back toward centring on the fragment, discarding the pose just found.
+    atlas_sigma2 = None
+    if settings.atlas_sigma2_from_pose_factor is not None:
+        posed_model = apply_similarity(
+            working_mean + working_modes @ np.asarray(pose.coefficients, dtype=np.float64),
+            float(pose.scale if with_scale else 1.0),
+            np.asarray(pose.rotation, dtype=np.float64),
+            np.asarray(pose.translation, dtype=np.float64).reshape(3),
+        )
+        _, nearest = nearest_indices(posed_model, working_target)
+        mean_square = float(np.mean(nearest * nearest))
+        if np.isfinite(mean_square) and mean_square > 0.0:
+            atlas_sigma2 = float(settings.atlas_sigma2_from_pose_factor) * mean_square
+
     atlas_kwargs: dict[str, Any] = {
+        "sigma2": atlas_sigma2,
         "lambda_regularization": float(settings.atlas_lambda),
         "normalize": False,
         "optimize_similarity": True,
@@ -789,6 +983,8 @@ def run_completion(
         "k": None if settings.atlas_k is None else int(settings.atlas_k),
         "parallel": bool(settings.parallel),
         "single_precision": bool(settings.single_precision),
+        "scale_bounds": scale_bounds,
+        "adaptive_mixing": settings.adaptive_mixing,
     }
     if use_landmarks:
         atlas_kwargs.update(
@@ -892,6 +1088,8 @@ def run_completion(
         target_centroid=target_centroid.reshape(3),
         retained_modes=ssm.retained_modes,
         retained_variance=ssm.retained_variance,
+        scale_bounds=scale_bounds,
+        atlas_initial_sigma2=atlas_sigma2,
     )
 
 
@@ -1643,6 +1841,15 @@ def completion_diagnostics(
         "pose_effective_hypotheses_within_run_only": float(pose.effective_hypotheses),
         "pose_hypotheses_evaluated": int(pose.hypotheses_evaluated),
         "pose_hypotheses_refined": int(pose.hypotheses_refined),
+        "pose_distinct_hypotheses": _optional_int(getattr(pose, "distinct_hypotheses", None)),
+        "pose_winner_support": _optional_int(getattr(pose, "winner_support", None)),
+        "pose_translation_anchors_requested": int(settings.effective_anchor_count()),
+        "pose_translation_anchors_used": _optional_int(
+            getattr(pose, "translation_anchors_used", None)
+        ),
+        "pose_scale_bounds": result.scale_bounds,
+        "atlas_initial_sigma2_from_pose": result.atlas_initial_sigma2,
+        "pose_adaptive_mixing": settings.adaptive_mixing,
         "conditional_epistemic_std_median": float(np.median(np.sqrt(result.epistemic_variance))),
         "conditional_total_std_median": float(np.median(np.sqrt(result.total_variance))),
         "posterior_surface_only_mean_rms_from_constrained_atlas": float(
@@ -1655,6 +1862,35 @@ def completion_diagnostics(
         ),
         "calibration_message": str(calibration_message),
     }
+    anchors_used = diagnostics["pose_translation_anchors_used"]
+    if (
+        settings.is_fragment()
+        and settings.effective_anchor_count() > 1
+        and anchors_used is not None
+        and anchors_used <= 1
+    ):
+        diagnostics["pose_seeding_warning"] = (
+            "Translation seeding was requested for a fragment but rustcpd used the "
+            "centroid seed only. The target did not look smaller than the SSM in the "
+            "pose frame: check that the residual scale is fixed or bounded and that "
+            "the coverage estimate is not too high."
+        )
+    else:
+        diagnostics["pose_seeding_warning"] = None
+    mixing = getattr(atlas, "mixing_weights", None)
+    if mixing is not None:
+        mixing = np.asarray(mixing, dtype=np.float64)
+        # Fraction of mixing mass on points classified as data-proximal: a
+        # coarse check that adaptive mixing switched off the unobserved region.
+        diagnostics["atlas_mixing_weight_min"] = float(np.min(mixing))
+        diagnostics["atlas_mixing_weight_max"] = float(np.max(mixing))
+        diagnostics["atlas_mixing_effective_points"] = float(
+            np.exp(-np.sum(mixing * np.log(np.maximum(mixing, 1e-300))))
+        )
+    else:
+        diagnostics["atlas_mixing_weight_min"] = None
+        diagnostics["atlas_mixing_weight_max"] = None
+        diagnostics["atlas_mixing_effective_points"] = None
     landmark_rms = float(getattr(atlas, "landmark_rms", float("nan")))
     diagnostics["landmark_rms"] = landmark_rms if np.isfinite(landmark_rms) else None
     if result.landmark_sigma is not None and np.isfinite(landmark_rms):
@@ -1690,6 +1926,10 @@ def completion_diagnostics(
         diagnostics["calibration_simultaneous_radius_available"] = False
         diagnostics["calibrated_fit_success_probability"] = None
     return diagnostics
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    return None if value is None else int(value)
 
 
 def _points(value: np.ndarray, name: str) -> np.ndarray:

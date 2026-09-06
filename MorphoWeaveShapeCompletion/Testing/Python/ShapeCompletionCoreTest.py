@@ -1,4 +1,5 @@
 import ast
+import inspect
 from pathlib import Path
 import tempfile
 import unittest
@@ -11,6 +12,9 @@ import sys
 sys.path.insert(0, str(CORE_DIR))
 
 from MorphoWeaveShapeCompletionCore import (
+    bbox_diagonal,
+    completion_diagnostics,
+    coverage_scale_candidates,
     CalibrationAccumulator,
     CompletionSettings,
     RidgeLogisticCalibrator,
@@ -150,12 +154,197 @@ class ShapeCompletionCoreUnitTest(unittest.TestCase):
         self.assertEqual(settings.coverage, 1.0)
         self.assertTrue(settings.with_scale())
         settings.coverage = 0.60
+        # Automatic policy keeps the scale free for fragments too, but bounded.
+        self.assertTrue(settings.with_scale())
+        self.assertIsNotNone(settings.scale_bounds())
+        settings.residual_scale_policy = "fixed"
         self.assertFalse(settings.with_scale())
         state, message = landmark_recommendation(0.74, 0)
         self.assertEqual(state, "recommended")
         self.assertIn("below 0.75", message)
         self.assertEqual(landmark_recommendation(0.75, 0)[0], "optional")
         self.assertEqual(landmark_recommendation(0.60, 3)[0], "available")
+
+    def test_fragment_seeding_settings_gate_on_coverage_and_scale(self):
+        # Complete target: classic single seed, scale free and unbounded.
+        complete = CompletionSettings(coverage=1.0, translation_anchor_count=6)
+        self.assertFalse(complete.is_fragment())
+        self.assertEqual(complete.effective_anchor_count(), 1)
+        self.assertIsNone(complete.scale_bounds())
+        # Fragment with the automatic policy: scale free but bounded, seeds requested.
+        fragment = CompletionSettings(coverage=0.45, translation_anchor_count=6)
+        self.assertTrue(fragment.is_fragment())
+        self.assertEqual(fragment.effective_anchor_count(), 6)
+        self.assertTrue(fragment.with_scale())
+        fixed = CompletionSettings(coverage=0.45, residual_scale_policy="fixed")
+        self.assertIsNone(fixed.scale_bounds(), "bounds only matter for a free scale")
+        # Without candidates the interval is 1 ± margin; with candidates it spans them.
+        free = CompletionSettings(
+            coverage=0.45, residual_scale_policy="free", free_scale_bounds_fraction=0.2
+        )
+        low, high = free.scale_bounds()
+        self.assertAlmostEqual(low, 0.8)
+        self.assertAlmostEqual(high, 1.25)
+        low, high = free.scale_bounds(np.array([0.9, 1.0, 1.1]))
+        self.assertAlmostEqual(low, 0.9 * 0.8)
+        self.assertAlmostEqual(high, 1.1 / 0.8)
+        unbounded = CompletionSettings(
+            coverage=0.45, residual_scale_policy="free", free_scale_bounds_fraction=None
+        )
+        self.assertIsNone(unbounded.scale_bounds())
+        for bad in (
+            dict(translation_anchor_count=0),
+            dict(anchor_completeness_threshold=0.0),
+            dict(free_scale_bounds_fraction=1.0),
+            dict(adaptive_mixing=-1.0),
+            dict(initial_sigma2=0.0),
+            dict(merge_tolerance=-0.1),
+        ):
+            with self.assertRaises(ValueError):
+                CompletionSettings(**bad).validate()
+
+    def test_pipeline_forwards_partial_target_options_to_rustcpd(self):
+        mean, modes, eigenvalues = synthetic_ssm(m=60)
+        target = mean[:24] + np.array([0.3, -0.2, 0.4])
+        settings = CompletionSettings(
+            coverage=0.40,
+            coverage_prescale=False,
+            residual_scale_policy="free",
+            free_scale_bounds_fraction=0.15,
+            translation_anchor_count=5,
+            adaptive_mixing=1.0,
+            initial_sigma2=0.2,
+            merge_tolerance=0.03,
+            target_point_count=100,
+        )
+        fake = _FakeRustCPD()
+        run_completion(target, mean, modes, eigenvalues, settings, rustcpd_module=fake)
+        pose_kwargs = fake.pose_call[3]
+        atlas_kwargs = fake.atlas_call[3]
+        self.assertEqual(pose_kwargs["translation_anchor_count"], 5)
+        self.assertAlmostEqual(pose_kwargs["anchor_completeness_threshold"], 0.9)
+        self.assertEqual(pose_kwargs["adaptive_mixing"], 1.0)
+        self.assertEqual(pose_kwargs["initial_sigma2"], 0.2)
+        self.assertEqual(pose_kwargs["merge_tolerance"], 0.03)
+        self.assertEqual(pose_kwargs["scale_bounds"], atlas_kwargs["scale_bounds"])
+        self.assertAlmostEqual(pose_kwargs["scale_bounds"][0], 0.85)  # prescale off: 1 ± f
+        self.assertEqual(atlas_kwargs["adaptive_mixing"], 1.0)
+        self.assertIsNotNone(atlas_kwargs["sigma2"], "atlas continues from the pose residual")
+        self.assertGreater(atlas_kwargs["sigma2"], 0.0)
+        # Complete targets never request extra seeds even if the UI asks.
+        fake = _FakeRustCPD()
+        run_completion(
+            mean + 0.1, mean, modes, eigenvalues,
+            CompletionSettings(coverage=1.0, translation_anchor_count=5, target_point_count=100),
+            rustcpd_module=fake,
+        )
+        self.assertEqual(fake.pose_call[3]["translation_anchor_count"], 1)
+        self.assertIsNone(fake.pose_call[3]["scale_bounds"])
+
+    def test_diagnostics_report_seeding_and_degrade_on_old_pose_objects(self):
+        mean, modes, eigenvalues = synthetic_ssm(m=60)
+        target = mean[:24]
+        settings = CompletionSettings(
+            coverage=0.40, coverage_prescale=False, translation_anchor_count=6,
+            target_point_count=100,
+        )
+        fake = _FakeRustCPD()
+        result = run_completion(target, mean, modes, eigenvalues, settings, rustcpd_module=fake)
+        # The fake _Pose predates the seeding API: everything degrades to None
+        # and no warning can be issued.
+        diagnostics = completion_diagnostics(result, settings, landmark_count=0)
+        self.assertIsNone(diagnostics["pose_translation_anchors_used"])
+        self.assertIsNone(diagnostics["pose_winner_support"])
+        self.assertIsNone(diagnostics["pose_seeding_warning"])
+        self.assertEqual(diagnostics["pose_translation_anchors_requested"], 6)
+        # A pose object reporting that only the centroid seed was used triggers
+        # the warning for fragments.
+        result.pose.translation_anchors_used = 1
+        result.pose.winner_support = 3
+        result.pose.distinct_hypotheses = 2
+        diagnostics = completion_diagnostics(result, settings, landmark_count=0)
+        self.assertEqual(diagnostics["pose_winner_support"], 3)
+        self.assertIn("centroid seed only", diagnostics["pose_seeding_warning"])
+        result.pose.translation_anchors_used = 5
+        diagnostics = completion_diagnostics(result, settings, landmark_count=0)
+        self.assertIsNone(diagnostics["pose_seeding_warning"])
+        # Mixing weights, when present on the atlas result, are summarized.
+        result.atlas.mixing_weights = np.full(len(mean), 1.0 / len(mean))
+        diagnostics = completion_diagnostics(result, settings, landmark_count=0)
+        self.assertAlmostEqual(diagnostics["atlas_mixing_effective_points"], len(mean), places=6)
+
+    def test_coverage_scale_candidates_ignore_strips_and_recover_true_scale(self):
+        rng = np.random.default_rng(5)
+        m = 1200
+        z = np.sort(rng.uniform(0, 1, m))
+        theta = rng.uniform(0, 2 * np.pi, m)
+        radius = 4 + 6 * z + 9 * np.exp(-(((z - 0.06) / 0.06) ** 2))
+        bone = np.column_stack((100 * z, radius * np.cos(theta), radius * np.sin(theta)))
+        for selector in (z < 0.33, (z > 0.33) & (z < 0.66), z > 0.67):
+            fragment = bone[selector]
+            candidates = coverage_scale_candidates(bone, fragment, 0.33)
+            self.assertGreaterEqual(len(candidates), 3)
+            # Longitudinal strips (scale ~0.4) must not vote; the true scale is 1.
+            self.assertGreater(float(np.min(candidates)), 0.7)
+            self.assertLess(abs(float(np.median(candidates)) - 1.0), 0.2)
+        # Complete target: classic RMS-radius ratio.
+        full = coverage_scale_candidates(bone, 2.0 * bone, 1.0)
+        self.assertEqual(len(full), 1)
+        self.assertAlmostEqual(float(full[0]), 2.0, places=6)
+        # The old bbox-diagonal rule was fooled by the head: check it really was worse.
+        head_fragment = bone[z < 0.33]
+        old_rule = (bbox_diagonal(head_fragment) / 0.33) / bbox_diagonal(bone)
+        self.assertGreater(old_rule, 1.3)
+
+    def test_end_to_end_with_real_rustcpd_places_displaced_fragment(self):
+        try:
+            import rustcpd
+        except ImportError:  # pragma: no cover - optional dependency
+            self.skipTest("rustcpd is not installed")
+        if "translation_anchor_count" not in inspect.signature(rustcpd.pose_initialize).parameters:
+            self.skipTest("installed rustcpd predates translation seeding")
+        rng = np.random.default_rng(11)
+        m = 600
+        z = np.sort(rng.uniform(0, 1, m))
+        theta = rng.uniform(0, 2 * np.pi, m)
+        radius = 4 + 6 * z + 9 * np.exp(-(((z - 0.06) / 0.06) ** 2))
+        mean = np.column_stack((100 * z, radius * np.cos(theta), radius * np.sin(theta)))
+        modes = np.zeros((m, 3, 2))
+        modes[:, 1, 0] = np.sin(np.pi * z)
+        modes[:, 2, 1] = np.sin(2 * np.pi * z)
+        flat = modes.reshape(3 * m, 2)
+        modes = (flat / np.linalg.norm(flat, axis=0)).reshape(m, 3, 2)
+        eigenvalues = np.array([9.0, 4.0])
+        truth = mean + modes @ np.array([1.5, -1.0])
+        angle = 0.5
+        rotation = np.array(
+            [[np.cos(angle), -np.sin(angle), 0], [np.sin(angle), np.cos(angle), 0], [0, 0, 1]]
+        )
+        posed = truth @ rotation + np.array([30.0, -20.0, 10.0])
+        selector = z < 0.33  # proximal third, well away from the bone centre
+        fragment = posed[selector] + rng.normal(scale=0.05, size=(int(selector.sum()), 3))
+        settings = CompletionSettings(
+            coverage=0.33,
+            target_point_count=200,
+            rotation_count=25,
+            coarse_source_count=300,
+            coarse_target_count=200,
+            coarse_rank=2,
+            refine_count=6,
+            refine_target_count=200,
+            refine_iterations=25,
+            atlas_max_iterations=100,
+            parallel=False,
+        )
+        result = run_completion(fragment, mean, modes, eigenvalues, settings, rustcpd_module=rustcpd)
+        diagnostics = completion_diagnostics(result, settings, landmark_count=0)
+        self.assertGreater(diagnostics["pose_translation_anchors_used"], 1)
+        self.assertIsNone(diagnostics["pose_seeding_warning"])
+        axis = np.array([1.0, 0.0, 0.0]) @ rotation
+        axial_error = float(np.mean(np.abs((result.completed_points - posed) @ axis)))
+        self.assertLess(axial_error, 1.0, f"fragment not placed at the proximal end: {axial_error} mm")
+        self.assertLess(abs(result.world_scale - 1.0), 0.05)
+        self.assertLess(result.atlas.sigma2, 0.05)
 
     def test_ssm_validation_and_truncation(self):
         mean, modes, eigenvalues = synthetic_ssm()
@@ -208,6 +397,7 @@ class ShapeCompletionCoreUnitTest(unittest.TestCase):
             coverage=0.60,
             use_landmarks=True,
             coverage_prescale=False,
+            residual_scale_policy="fixed",
             target_point_count=100,
             posterior_samples=2,
             atlas_lambda=7.5,
@@ -586,8 +776,7 @@ class ShapeCompletionCoreUnitTest(unittest.TestCase):
         self.assertIn("meshwise_simultaneous_empirical_coverage", entry["held_out_mesh_audit"])
 
     def test_main_module_contains_required_ui_and_no_unconstrained_cpd(self):
-        # The single-specimen UI moved into the base during Batch integration.
-        source_path = MODULE_DIR / "Resources" / "Python" / "MorphoWeaveShapeCompletionBase.py"
+        source_path = MODULE_DIR / "Resources/Python/MorphoWeaveShapeCompletionBase.py"
         source = source_path.read_text(encoding="utf-8")
         ast.parse(source, filename=str(source_path))
         self.assertIn("Target coverage:", source)

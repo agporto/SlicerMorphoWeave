@@ -4,14 +4,12 @@ import unittest
 from pathlib import Path
 
 MODULE_DIR = Path(__file__).resolve().parents[2]
-ENTRYPOINT = MODULE_DIR / "MorphoWeaveShapeCompletion.py"
-MODULE = MODULE_DIR / "Resources" / "Python" / "MorphoWeaveShapeCompletionBase.py"
+MODULE = MODULE_DIR / "Resources/Python/MorphoWeaveShapeCompletionBase.py"
 CORE = MODULE_DIR / "Resources" / "Python" / "MorphoWeaveShapeCompletionCore.py"
 
 
 class ShapeCompletionModuleSourceTest(unittest.TestCase):
     def test_python_sources_parse(self):
-        ast.parse(ENTRYPOINT.read_text(encoding="utf-8"), filename=str(ENTRYPOINT))
         ast.parse(MODULE.read_text(encoding="utf-8"), filename=str(MODULE))
         ast.parse(CORE.read_text(encoding="utf-8"), filename=str(CORE))
 
@@ -44,7 +42,28 @@ class ShapeCompletionModuleSourceTest(unittest.TestCase):
         self.assertIn('"ShapePosterior"', source)
         self.assertIn('"AtlasResult"', source)
         self.assertIn('"posterior"', source)
-        self.assertIn("pose-landmark-keypoints functionality", source)
+        self.assertIn('"rustcpd==4.0.0"', source)
+        for name in (
+            '"translation_anchor_count"',
+            '"scale_bounds"',
+            '"adaptive_mixing"',
+            '"initial_sigma2"',
+            '"merge_tolerance"',
+            '"translation_anchors_used"',
+            '"winner_support"',
+            '"mixing_weights"',
+        ):
+            self.assertIn(name, source)
+
+    def test_fragments_default_to_pinned_scale_and_seeding_ui(self):
+        source = MODULE.read_text(encoding="utf-8")
+        # "Always free" as the default silently disables translation seeding.
+        self.assertIn("self.scale_policy_combo.setCurrentIndex(0)", source)
+        self.assertIn("Partial-Target Pose Seeding", source)
+        self.assertIn("pose_seeding_warning", source)
+        core = CORE.read_text(encoding="utf-8")
+        self.assertIn("def effective_anchor_count", core)
+        self.assertIn("def scale_bounds", core)
 
 
     def test_calibration_fragments_come_from_complete_mesh_surface(self):

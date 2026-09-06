@@ -1,34 +1,17 @@
+> Local restoration: start with [RESTORATION.md](RESTORATION.md) for installation, Batch, and validation limits. The algorithm documentation below is retained from the supplied working module.
+
 # MorphoWeave Shape Completion
 
 `MorphoWeaveShapeCompletion` completes a partial target surface using the Statistical Shape Model already loaded by **Model Library**. It is a separate module rather than an option inside Landmark Transfer because its estimand and outputs are different: Landmark Transfer predicts sparse landmarks on an observed surface, whereas Shape Completion infers the unobserved part of the surface and reports uncertainty in that inference.
 
 See [TUTORIAL.md](TUTORIAL.md) for a complete first-run walkthrough, high-resolution settings, output interpretation, calibration, and troubleshooting.
 
-## Installing this module patch
+## Installing this local restoration
 
-The full integration package places `install_into_checkout.py` beside the
-`MorphoWeaveShapeCompletion` directory. From that package root, preview the
-repository changes with:
-
-```bash
-python install_into_checkout.py /path/to/SlicerMorphoWeave --dry-run
-```
-
-Install into the checkout with:
-
-```bash
-python install_into_checkout.py /path/to/SlicerMorphoWeave
-```
-
-Use `--force` to replace an existing Shape Completion directory. The previous
-directory is moved to `.shape-completion-backup/MorphoWeaveShapeCompletion`
-before replacement. The installer updates the root CMake file, root README, and
-main MorphoWeave tutorial idempotently.
-
-When using a module-only archive, copy `MorphoWeaveShapeCompletion` into the
-repository root and add `add_subdirectory(MorphoWeaveShapeCompletion)` to the
-root `CMakeLists.txt`. The full integration package is preferred because it also
-updates the project-level documentation and includes update and validation notes.
+This is a complete replacement **module directory**, not the entire extension.
+Follow [RESTORATION.md](RESTORATION.md). Preserve your working installation and
+replace only `MorphoWeaveShapeCompletion` in a separate copy of your existing
+`shape-completion` checkout. No package-level installer script is included.
 
 ## Registration pipeline
 
@@ -52,13 +35,23 @@ Landmark mode is strict: when selected, an invalid or absent landmark match stop
 
 **Target coverage** is an explicit input and defaults to `1.00`. It controls:
 
-- whether residual scale is free or fixed under the default automatic policy;
-- the optional extent/coverage source pre-scale for partial targets;
+- the coverage-consistent source pre-scale and the residual-scale bounds for partial targets;
+- whether translation seeding is requested from the pose search (below `0.95`);
 - posterior visibility/completeness;
 - calibration-profile matching; and
 - the landmark recommendation.
 
-Based on the current fragment experiments, the UI recommends at least three homologous landmarks below `0.75` coverage. The recommendation is not a substitute for checking whether the landmarks span a stable, non-collinear configuration. The extent/coverage pre-scale is a heuristic inherited from the existing fragment workflow and can be disabled when source and target already share meaningful physical scale.
+Based on the current fragment experiments, the UI recommends at least three homologous landmarks below `0.75` coverage. The recommendation is not a substitute for checking whether the landmarks span a stable, non-collinear configuration.
+
+## Off-centre fragments
+
+Three things used to make an end fragment (the proximal third of a long bone) come out centred on the bone instead of at its end, and each is addressed:
+
+1. **Translation seeding.** `rustcpd` seeds every rotation hypothesis not only with the SSM centroid on the fragment centroid but also with fragment-sized local centroids of the SSM, so "the fragment is the part of the model around here" is an explicit hypothesis. The module requests it for coverage below `0.95` (Advanced → *Partial-Target Pose Seeding*); rustcpd only activates it when the fragment is demonstrably smaller than the scale-constrained SSM, and the diagnostics report how many seeds were actually used.
+2. **Coverage-consistent pre-scale and scale bounds.** The former `diagonal(fragment) / coverage / diagonal(SSM)` rule is not consistent with coverage as a surface fraction and was fooled by chunky ends (a proximal third with the head inflated the SSM by 50 %). The pre-scale is now the median over many plane cuts of the SSM at the requested coverage, keeping only cuts whose scale-free shape resembles the fragment; the spread of those cuts bounds the residual scale. The default *Automatic* policy therefore keeps the scale free but bounded for fragments, which lets seeding activate and stops the SSM from shrinking into the fragment. *Always fixed* pins the scale at the median pre-scale.
+3. **Atlas warm start.** The pure atlas stage inherits the pose but previously restarted its variance from the whole-SSM spread, hundreds of times too soft for a fragment, and the first EM steps re-centred the SSM, discarding the pose just found. It now starts from the pose's own nearest-neighbour residual (`atlas_sigma2_from_pose_factor`).
+
+On a synthetic tapered tube with a head, these changes take a displaced proximal third from ~30 mm of axial error (scale collapsed to 0.1) to well under 0.1 mm at scale 1.00; a featureless distal end remains ambiguous to a few millimetres, which is where landmarks are still needed.
 
 ## Full-resolution surface transfer
 
@@ -75,6 +68,11 @@ Dense controls that coincide with template vertices are made exact one-hot ancho
 Full-resolution posterior sample surfaces are disabled by default because duplicating a very large mesh can dominate memory. Latent samples are stored as dense SSM point clouds unless the user opts into full-resolution surfaces. Sample spread represents coefficient-posterior uncertainty, not the additional noise and discrepancy terms in `CompletionTotalStd`.
 
 ## Landmark matching and uncertainty
+
+**Restoration note:** the following uncertainty description is retained from the
+working upload. It does not establish matched-prior or calibrated uncertainty
+under rustcpd 4.0.0; see the explicit caveat in RESTORATION.md.
+
 
 Template and target landmarks are matched by normalized control-point labels. Ordered matching is disabled by default and must be explicitly enabled. The matched template sparse landmarks are mapped to unique dense SSM indices. The module rejects:
 
@@ -181,10 +179,10 @@ When an output directory is selected, the module also writes:
 
 ## Runtime dependency
 
-The module requires exactly **`rustcpd==4.0.0`**, shared with Landmark Transfer, containing the pose-landmark-keypoints and completion APIs, including:
+The module requires `rustcpd==4.0.0`, containing the pose-landmark-keypoints, partial-target and completion APIs, including:
 
-- `pose_initialize(..., landmark_sigma=..., refine_landmark_sigma=..., with_scale=...)`;
-- `register_atlas(..., landmark_sigma=..., initial_*=...)`;
+- `pose_initialize(..., landmark_sigma=..., refine_landmark_sigma=..., with_scale=..., translation_anchor_count=..., scale_bounds=..., adaptive_mixing=..., initial_sigma2=..., merge_tolerance=...)`;
+- `register_atlas(..., landmark_sigma=..., initial_*=..., scale_bounds=..., adaptive_mixing=...)`;
 - `AtlasResult.posterior(...)`; and
 - `ShapePosterior.predict`, `predictive_variance`, and `sample_shapes`.
 
@@ -210,7 +208,7 @@ The Slicer-independent test suites currently contain 53 tests covering:
 - profile fingerprint, settings, seed, mode, and coverage gating; and
 - source-contract checks that enforce pose search → refinement → pure atlas → posterior with no unconstrained CPD;
 - source contracts for cached full-resolution transfer, opt-in large sample surfaces, and checked file saves; and
-- installer dry-run, idempotence, backup, refusal, and forced-replacement behavior.
+- the supplied package-level installer tests, which are skipped in this module-only archive.
 
 The pure-Python suites do not replace an in-Slicer smoke test against the native `rustcpd` build.
 

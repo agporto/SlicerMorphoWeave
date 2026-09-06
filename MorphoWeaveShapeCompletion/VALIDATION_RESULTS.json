@@ -1,0 +1,38 @@
+{
+  "suites": [
+    {
+      "suite": "ShapeCompletionCoreTest.py",
+      "run": 32,
+      "passed": 31,
+      "skipped": 1,
+      "returncode": 0
+    },
+    {
+      "suite": "ShapeCompletionModuleSourceTest.py",
+      "run": 25,
+      "passed": 25,
+      "skipped": 0,
+      "returncode": 0
+    },
+    {
+      "suite": "FragmentRestorationTest.py",
+      "run": 17,
+      "passed": 17,
+      "skipped": 0,
+      "returncode": 0
+    },
+    {
+      "suite": "ShapeCompletionInstallerTest.py",
+      "run": 4,
+      "passed": 0,
+      "skipped": 4,
+      "returncode": 0
+    }
+  ],
+  "passed": 73,
+  "skipped": 5,
+  "python_files_parsed": 10,
+  "native_backend_available": false,
+  "live_slicer_tested": false,
+  "github_written": false
+}

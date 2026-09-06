@@ -1,3 +1,5 @@
+> Local restoration: start with [RESTORATION.md](RESTORATION.md) for installation, Batch, and validation limits. The algorithm documentation below is retained from the supplied working module.
+
 # MorphoWeave Shape Completion Tutorial
 
 This tutorial walks through completing a partial anatomical surface with a Statistical Shape Model (SSM), inspecting uncertainty, and using the scalable exact-pose-plus-residual transfer on meshes containing about 1,000,000 vertices.
@@ -76,6 +78,10 @@ Set **Target coverage** to the estimated fraction of the complete anatomy repres
 Coverage affects scale policy, posterior completeness, calibration-profile matching, and the display mask separating data-proximal from inferred regions.
 
 The default advanced setting pre-scales a partial target using fragment extent divided by coverage, then fixes residual scale. This is a practical fragment heuristic, not a geometric identity. Disable **Pre-scale the SSM using target extent and supplied coverage** when source and target already share a trustworthy physical scale or when validation shows the heuristic is biased for the expected cut pattern.
+
+### 4b. Fragments away from the centre of the model
+
+If the fragment is one end of an elongated object, nothing extra is needed: below `0.95` coverage the pose search seeds translations at fragment-sized local centroids of the SSM, the residual scale is kept within the range a fragment of this coverage can have anywhere on the SSM, and the atlas stage continues from the pose it inherits. Check the diagnostics after the run: *translation seeds per rotation: requested 6, used N* with `N > 1` confirms seeding engaged, and *refined starts agreeing with the winner* shows how many independent starts landed on the same answer. If `used` is `1` for a fragment, a warning explains why (usually the coverage estimate was too high or the scale was left unbounded). Featureless ends can still slide by a few millimetres along a nearly straight shaft; that is the case for landmarks.
 
 ### 5. Choose surface-only or landmark-assisted completion
 
