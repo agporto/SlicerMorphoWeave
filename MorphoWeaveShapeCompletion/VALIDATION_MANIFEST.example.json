@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "units": "mm",
+  "model_npz": "data/model.npz",
+  "ssm_training_ids": ["training-specimen-001", "training-specimen-002"],
+  "settings": {"atlas_lambda": 5.0, "pose_lambda": 5.0, "seed": 0},
+  "specimens": [
+    {
+      "specimen_id": "heldout-specimen-001",
+      "split": "tuning",
+      "npz": "data/heldout-specimen-001.npz",
+      "coverage": 0.33,
+      "dense_correspondence_verified": true,
+      "external_status": "unverified"
+    },
+    {
+      "specimen_id": "heldout-specimen-002",
+      "split": "calibration",
+      "npz": "data/heldout-specimen-002.npz",
+      "coverage": 0.33,
+      "dense_correspondence_verified": true,
+      "external_status": "unverified"
+    },
+    {
+      "specimen_id": "heldout-specimen-003",
+      "split": "test",
+      "npz": "data/heldout-specimen-003.npz",
+      "coverage": 0.33,
+      "dense_correspondence_verified": true,
+      "external_status": "unverified"
+    }
+  ]
+}

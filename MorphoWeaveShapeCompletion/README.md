@@ -1,4 +1,4 @@
-> Local restoration: start with [RESTORATION.md](RESTORATION.md) for installation, Batch, and validation limits. The algorithm documentation below is retained from the supplied working module.
+> Correctness update based on shape-completion commit e397882d. Start with [RESTORATION.md](RESTORATION.md) for safe installation and incompatible calibration-profile changes, and [VALIDATION_PROTOCOL.md](VALIDATION_PROTOCOL.md) for the validation workflow. This working copy has not been published to GitHub.
 
 # MorphoWeave Shape Completion
 
@@ -69,9 +69,7 @@ Full-resolution posterior sample surfaces are disabled by default because duplic
 
 ## Landmark matching and uncertainty
 
-**Restoration note:** the following uncertainty description is retained from the
-working upload. It does not establish matched-prior or calibrated uncertainty
-under rustcpd 4.0.0; see the explicit caveat in RESTORATION.md.
+**Correctness update:** the posterior prior now uses rustcpd 4.0 precision semantics. Matching the prior does not establish calibrated uncertainty or include alternate poses/landmark precision; those limitations remain explicit below.
 
 
 Template and target landmarks are matched by normalized control-point labels. Ordered matching is disabled by default and must be explicitly enabled. The matched template sparse landmarks are mapped to unique dense SSM indices. The module rejects:
@@ -115,7 +113,7 @@ The completed coordinates are the final constrained atlas fit. This is especiall
 
 The current posterior is conditional on the selected pose and fitted surface correspondences. It does not integrate alternate pose basins, and its covariance does not yet include target-landmark precision. These limitations are displayed in the UI and saved diagnostics.
 
-The posterior coefficient prior is matched to atlas registration exactly: atlas regularization `λ` corresponds to posterior prior temperature `1/λ` (`λ=0` is represented by an effectively flat prior). This keeps the post-hoc uncertainty calculation consistent with the atlas coefficient objective.
+The posterior coefficient prior uses the same precision multiplier as atlas registration: `prior_temperature = atlas_lambda = λ` under rustcpd 4.0. The legacy parameter name does not mean a covariance temperature. Completion requires finite `λ > 0`: the pinned backend does not support an exact flat coefficient prior, so zero is rejected before fitting rather than silently approximated. Matching this scalar alone does not match the full conditioning information or establish calibrated uncertainty.
 
 ## Calibration from complete meshes
 
@@ -124,7 +122,7 @@ The **Calibration** tab accepts a directory of complete meshes and generates det
 Two calibration truth targets are supported:
 
 - **Exact dense correspondence error** when a complete paired dense-truth markup directory is supplied. Every mesh must have a paired file with the SSM point count and matching point order.
-- **Distance to complete surface** when only complete meshes are supplied. Predicted loci are evaluated against their nearest complete-surface locations, and inferred-region membership is determined from those truth-side locations. This calibrates surface recovery, not homologous point error.
+- **Distance to complete surface** when only complete meshes are supplied. Predicted dense loci are evaluated against closest points on the complete triangle surface, and inferred-region membership is determined from those truth-side locations. This is the predicted-to-reference direction and requires a triangle surface, not a point cloud. Optimize uses the other direction, withheld reference samples to the predicted triangle surface. Neither direction alone measures homologous point error.
 
 A complete paired sparse-landmark directory may be supplied for landmark-assisted calibration. Visible landmarks are selected using the same generated plane cut; examples with fewer than three usable landmarks are skipped rather than silently converted to surface-only calibration.
 
@@ -143,6 +141,7 @@ Every profile stores:
 
 - SHA-256 of the full SSM mean, modes, and eigenvalues;
 - a signature of all completion and uncertainty settings that affect the fit, including the pose-search seed;
+- the actual rustcpd version, algorithm revision and hashes of the core, widget/calibration and geometry-helper sources;
 - coverage, landmark mode, and truth target;
 - fit, mesh, and point counts;
 - spatial calibration scales and audits;
@@ -151,12 +150,16 @@ Every profile stores:
 
 Profiles made from SSM training meshes are explicitly labelled **internal calibration** and may be optimistic for new specimens. A profile is applied only when:
 
+- the profile is the current version with complete implementation provenance;
+- the backend version and source hashes match exactly;
 - the SSM fingerprint matches exactly;
 - the inference/uncertainty settings signature matches;
 - landmark mode matches; and
 - a calibrated coverage lies within `0.05` of the requested coverage.
 
-Otherwise calibrated radii and probabilities are omitted. Exact and surface-distance truth targets are never mixed silently.
+Otherwise calibrated radii and probabilities are omitted. Legacy version-1 profiles and profiles missing signatures/provenance must be regenerated, not relabeled or manually upgraded. Exact and surface-distance truth targets are never mixed silently.
+
+Pooled pointwise scales are empirical marginal calibration across correlated loci, not an automatic distribution-free guarantee for a new specimen. The simultaneous route uses independent complete meshes as its units and needs at least 19 calibration meshes for a finite 95% quantile. Its guarantee is limited to evaluated dense loci under the calibration masking protocol. The grouped audit holds out whole meshes from its scale estimate; keep an additional untouched specimen set for final evaluation. Registration/scoring failures are counted separately, and the success classifier describes returned, scored fits, not unconditional operational reliability.
 
 ## Scene and file outputs
 
@@ -190,14 +193,16 @@ The dependency is checked when the module opens. The preflight validates the req
 
 ## Tests
 
-The Slicer-independent test suites currently contain 53 tests covering:
+The Slicer-independent suites cover:
 
 - SSM validation and truncation;
 - landmark matching, geometry checks, and strict no-fallback behavior;
 - exact forwarding of one effective physical landmark standard deviation to all constrained stages;
 - inclusion of sparse-to-dense mapping uncertainty;
 - surface-only API behavior;
-- reciprocal atlas/posterior prior consistency;
+- rustcpd 4.0 atlas/posterior precision consistency and explicit zero-prior rejection;
+- mandatory calibration implementation/backend provenance and legacy invalidation;
+- closest-triangle scoring, truth-side positions and rigid-pose handling;
 - deterministic fragment masks and truth-side inferred-region calibration;
 - coordinate-frame compatibility checks;
 - exact similarity reproduction under full-resolution pose/residual transfer;

@@ -1,38 +1,41 @@
 {
-  "suites": [
+  "baseline_commit": "e397882d54994479ef19279756b8beb82d382856",
+  "run": 113,
+  "passed": 109,
+  "failures": 0,
+  "errors": 0,
+  "skipped": [
     {
-      "suite": "ShapeCompletionCoreTest.py",
-      "run": 32,
-      "passed": 31,
-      "skipped": 1,
-      "returncode": 0
+      "test": "test_installer_dry_run_install_refusal_and_force_replace (ShapeCompletionInstallerTest.ShapeCompletionInstallerTest.test_installer_dry_run_install_refusal_and_force_replace)",
+      "reason": "package-level installer is not present"
     },
     {
-      "suite": "ShapeCompletionModuleSourceTest.py",
-      "run": 25,
-      "passed": 25,
-      "skipped": 0,
-      "returncode": 0
+      "test": "test_root_cmake_update_is_idempotent_and_ordered (ShapeCompletionInstallerTest.ShapeCompletionInstallerTest.test_root_cmake_update_is_idempotent_and_ordered)",
+      "reason": "package-level installer is not present"
     },
     {
-      "suite": "FragmentRestorationTest.py",
-      "run": 17,
-      "passed": 17,
-      "skipped": 0,
-      "returncode": 0
+      "test": "test_root_readme_update_is_idempotent (ShapeCompletionInstallerTest.ShapeCompletionInstallerTest.test_root_readme_update_is_idempotent)",
+      "reason": "package-level installer is not present"
     },
     {
-      "suite": "ShapeCompletionInstallerTest.py",
-      "run": 4,
-      "passed": 0,
-      "skipped": 4,
-      "returncode": 0
+      "test": "test_tutorial_inserts_description_and_full_section_once (ShapeCompletionInstallerTest.ShapeCompletionInstallerTest.test_tutorial_inserts_description_and_full_section_once)",
+      "reason": "package-level installer is not present"
     }
   ],
-  "passed": 73,
-  "skipped": 5,
-  "python_files_parsed": 10,
-  "native_backend_available": false,
+  "elapsed_seconds": 2.1025239149998924,
+  "python": "3.12.14",
+  "numpy": "2.3.5",
+  "scipy": "1.17.0",
+  "vtk": "9.3.1",
+  "rustcpd": "4.0.0",
+  "native_backend_available": true,
   "live_slicer_tested": false,
-  "github_written": false
+  "biological_holdout_tested": false,
+  "github_written": false,
+  "baseline_before_changes": {
+    "run": 78,
+    "errors": 17,
+    "skipped": 5,
+    "note": "All 17 restoration setup errors were the existing test double missing currentChanged from the Optimize tab. Native backend not yet installed for this initial baseline."
+  }
 }

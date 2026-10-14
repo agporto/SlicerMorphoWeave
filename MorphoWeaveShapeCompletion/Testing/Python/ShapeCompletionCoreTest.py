@@ -1,8 +1,10 @@
 import ast
+import copy
 import inspect
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -11,6 +13,7 @@ CORE_DIR = MODULE_DIR / "Resources" / "Python"
 import sys
 sys.path.insert(0, str(CORE_DIR))
 
+import MorphoWeaveShapeCompletionCore as completion_core
 from MorphoWeaveShapeCompletionCore import (
     bbox_diagonal,
     completion_diagnostics,
@@ -24,6 +27,7 @@ from MorphoWeaveShapeCompletionCore import (
     build_calibration_profile,
     calibrated_radius,
     calibrated_simultaneous_radius,
+    calibration_implementation_provenance,
     calibration_method_signature,
     classify_completion_region,
     conformal_quantile,
@@ -415,11 +419,87 @@ class ShapeCompletionCoreUnitTest(unittest.TestCase):
         self.assertEqual(pose_kwargs["landmark_sigma"], pose_kwargs["refine_landmark_sigma"])
         self.assertEqual(pose_kwargs["landmark_sigma"], atlas_kwargs["landmark_sigma"])
         self.assertNotIn("landmark_weight", pose_kwargs)
-        self.assertAlmostEqual(fake.fit.posterior_kwargs["prior_temperature"], 1.0 / 7.5)
+        self.assertAlmostEqual(fake.fit.posterior_kwargs["prior_temperature"], 7.5)
         self.assertEqual(len(result.samples), 2)
         self.assertEqual(result.completed_points.shape, mean.shape)
         self.assertTrue(np.all(result.epistemic_variance >= 0))
         self.assertGreater(result.normalized_sigma2, 0)
+
+    def test_posterior_prior_precision_matches_positive_atlas_lambda(self):
+        mean, modes, eigenvalues = synthetic_ssm(m=30)
+        for strength in (1e-15, 0.25, 1.0, 7.5):
+            with self.subTest(atlas_lambda=strength):
+                fake = _FakeRustCPD()
+                settings = CompletionSettings(atlas_lambda=strength, pose_lambda=0.0)
+                run_completion(
+                    mean[:24], mean, modes, eigenvalues, settings, rustcpd_module=fake
+                )
+                self.assertEqual(fake.atlas_call[3]["lambda_regularization"], strength)
+                self.assertEqual(fake.fit.posterior_kwargs["prior_temperature"], strength)
+                # Zero pose regularization remains available; only completion's
+                # unsupported exact flat posterior is rejected.
+                self.assertEqual(fake.pose_call[3]["lambda_regularization"], 0.0)
+
+    def test_native_posterior_precision_matches_analytic_gaussian(self):
+        try:
+            import rustcpd
+        except ImportError:  # pragma: no cover - optional native dependency
+            self.skipTest("rustcpd is not installed")
+        mean, modes, eigenvalues = synthetic_ssm(m=12)
+        flat = modes.reshape(mean.size, len(eigenvalues))
+        residual = (flat @ np.array([0.4, -0.3, 0.2, 0.1])).reshape(mean.shape)
+        weights = np.r_[np.linspace(0.1, 1.0, 7), np.zeros(5)]
+        coordinate_weights = np.repeat(weights, 3)
+        sigma_eff2 = 0.7
+        information = (flat.T * coordinate_weights) @ flat / sigma_eff2
+        weighted_residual = flat.T @ (coordinate_weights * residual.reshape(-1)) / sigma_eff2
+        covariances = []
+        for strength in (0.25, 1.0, 7.5):
+            with self.subTest(prior_temperature=strength):
+                posterior = rustcpd.complete_shape(
+                    mean, flat, eigenvalues, residual, weights, sigma_eff2,
+                    np.eye(3), 1.0, np.zeros(3),
+                    prior_temperature=strength, estimate_discrepancy=False,
+                )
+                expected_covariance = np.linalg.inv(
+                    information + strength * np.diag(1.0 / eigenvalues)
+                )
+                expected_mean = expected_covariance @ weighted_residual
+                np.testing.assert_allclose(
+                    posterior.coefficient_covariance, expected_covariance, rtol=1e-10, atol=1e-12
+                )
+                np.testing.assert_allclose(
+                    posterior.coefficient_mean, expected_mean, rtol=1e-10, atol=1e-12
+                )
+                covariances.append(posterior.coefficient_covariance)
+        # Increasing prior strength must shrink, not expand, uncertainty.
+        for weaker, stronger in zip(covariances[:-1], covariances[1:]):
+            self.assertTrue(np.all(np.diag(stronger) < np.diag(weaker)))
+
+    def test_zero_atlas_lambda_rejected_before_native_fitting(self):
+        mean, modes, eigenvalues = synthetic_ssm(m=30)
+        fake = _FakeRustCPD()
+        with self.assertRaisesRegex(ValueError, "exact zero-strength.*flat.*posterior"):
+            run_completion(
+                mean[:24], mean, modes, eigenvalues,
+                CompletionSettings(atlas_lambda=0.0), rustcpd_module=fake,
+            )
+        self.assertIsNone(fake.pose_call)
+        self.assertIsNone(fake.atlas_call)
+
+    def test_invalid_prior_strengths_rejected_before_native_fitting(self):
+        mean, modes, eigenvalues = synthetic_ssm(m=30)
+        for name in ("atlas_lambda", "pose_lambda"):
+            for value in (-1.0, float("nan"), float("inf"), -float("inf")):
+                with self.subTest(setting=name, value=value):
+                    fake = _FakeRustCPD()
+                    with self.assertRaisesRegex(ValueError, name + ".*finite"):
+                        run_completion(
+                            mean[:24], mean, modes, eigenvalues,
+                            CompletionSettings(**{name: value}), rustcpd_module=fake,
+                        )
+                    self.assertIsNone(fake.pose_call)
+                    self.assertIsNone(fake.atlas_call)
 
 
     def test_constrained_atlas_remains_the_completion_point_estimate(self):
@@ -717,30 +797,37 @@ class ShapeCompletionCoreUnitTest(unittest.TestCase):
             generated_from_ssm_training_set=True,
             source_description="test",
             settings_snapshot=CompletionSettings().__dict__,
+            backend_version="4.0.0",
         )
         selected, _ = select_calibration_entry(
             profile, fingerprint=fingerprint, coverage=0.62, landmark_mode=True,
             current_settings=CompletionSettings(),
+            backend_version="4.0.0",
         )
         self.assertIsNotNone(selected)
         self.assertIsNone(select_calibration_entry(
-            profile, fingerprint="wrong", coverage=0.60, landmark_mode=True
+            profile, fingerprint="wrong", coverage=0.60, landmark_mode=True,
+            current_settings=CompletionSettings(), backend_version="4.0.0",
         )[0])
         self.assertIsNone(select_calibration_entry(
-            profile, fingerprint=fingerprint, coverage=0.60, landmark_mode=False
+            profile, fingerprint=fingerprint, coverage=0.60, landmark_mode=False,
+            current_settings=CompletionSettings(), backend_version="4.0.0",
         )[0])
         self.assertIsNone(select_calibration_entry(
-            profile, fingerprint=fingerprint, coverage=0.80, landmark_mode=True
+            profile, fingerprint=fingerprint, coverage=0.80, landmark_mode=True,
+            current_settings=CompletionSettings(), backend_version="4.0.0",
         )[0])
         changed = CompletionSettings(atlas_lambda=9.0)
         self.assertIsNone(select_calibration_entry(
             profile, fingerprint=fingerprint, coverage=0.60, landmark_mode=True,
             current_settings=changed,
+            backend_version="4.0.0",
         )[0])
         changed_seed = CompletionSettings(seed=19)
         self.assertIsNone(select_calibration_entry(
             profile, fingerprint=fingerprint, coverage=0.60, landmark_mode=True,
             current_settings=changed_seed,
+            backend_version="4.0.0",
         )[0])
         self.assertEqual(
             profile["method_signature_sha256"],
@@ -752,6 +839,127 @@ class ShapeCompletionCoreUnitTest(unittest.TestCase):
             loaded = load_calibration_profile(path)
             self.assertEqual(loaded["model_fingerprint_sha256"], fingerprint)
             self.assertTrue(loaded["generated_from_ssm_training_set"])
+
+    @staticmethod
+    def _profile_fixture(backend_version="4.0.0"):
+        settings = CompletionSettings()
+        fingerprint = model_fingerprint(*synthetic_ssm())
+        profile = build_calibration_profile(
+            fingerprint=fingerprint,
+            entries=[{
+                "coverage": 0.6,
+                "landmark_mode": False,
+                "truth_type": "surface_distance",
+                "conformal_scale": 2.0,
+            }],
+            generated_from_ssm_training_set=False,
+            source_description="test",
+            settings_snapshot=settings.__dict__,
+            backend_version=backend_version,
+        )
+        select_kwargs = dict(
+            fingerprint=fingerprint, coverage=0.6, landmark_mode=False,
+            current_settings=settings, backend_version=backend_version,
+        )
+        return profile, select_kwargs
+
+    def test_profiles_require_current_settings_and_backend_version(self):
+        profile, kwargs = self._profile_fixture()
+        self.assertEqual(profile["version"], 2)
+        self.assertEqual(profile["implementation_provenance"]["rustcpd_version"], "4.0.0")
+        for key, message in (("current_settings", "settings"), ("backend_version", "backend version")):
+            with self.subTest(missing=key):
+                incomplete = dict(kwargs)
+                del incomplete[key]
+                selected, reason = select_calibration_entry(profile, **incomplete)
+                self.assertIsNone(selected)
+                self.assertIn(message, reason)
+        for version in (None, "", "  ", "unknown"):
+            with self.subTest(backend_version=version):
+                with self.assertRaisesRegex(ValueError, "actual rustcpd backend version"):
+                    self._profile_fixture(backend_version=version)
+
+    def test_legacy_or_incomplete_profiles_rejected_by_load_and_select(self):
+        profile, kwargs = self._profile_fixture()
+        invalid_profiles = []
+        legacy = copy.deepcopy(profile)
+        legacy["version"] = 1
+        invalid_profiles.append(("legacy version", legacy))
+        for key in ("method_signature_sha256", "implementation_provenance"):
+            incomplete = copy.deepcopy(profile)
+            del incomplete[key]
+            invalid_profiles.append((key, incomplete))
+        for key in ("rustcpd_version", "algorithm_version", "source_sha256"):
+            incomplete = copy.deepcopy(profile)
+            del incomplete["implementation_provenance"][key]
+            invalid_profiles.append((key, incomplete))
+        for key in completion_core._CALIBRATION_SOURCE_FILES:
+            incomplete = copy.deepcopy(profile)
+            del incomplete["implementation_provenance"]["source_sha256"][key]
+            invalid_profiles.append((key, incomplete))
+        for signature in (None, "", "not-a-sha256"):
+            incomplete = copy.deepcopy(profile)
+            incomplete["method_signature_sha256"] = signature
+            invalid_profiles.append(("invalid signature " + str(signature), incomplete))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profile.json"
+            for label, invalid in invalid_profiles:
+                with self.subTest(profile=label):
+                    selected, reason = select_calibration_entry(invalid, **kwargs)
+                    self.assertIsNone(selected)
+                    self.assertIn("regenerate", reason)
+                    save_calibration_profile(invalid, path)
+                    with self.assertRaisesRegex(ValueError, "regenerate"):
+                        load_calibration_profile(path)
+
+    def test_profile_rejects_changed_backend_or_algorithm(self):
+        profile, kwargs = self._profile_fixture()
+        changed_backend = dict(kwargs, backend_version="4.0.1")
+        selected, reason = select_calibration_entry(profile, **changed_backend)
+        self.assertIsNone(selected)
+        self.assertIn("different rustcpd backend version", reason)
+        with mock.patch.object(completion_core, "CALIBRATION_ALGORITHM_VERSION", "future-revision"):
+            selected, reason = select_calibration_entry(profile, **kwargs)
+        self.assertIsNone(selected)
+        self.assertIn("different completion algorithm", reason)
+
+    def test_profile_source_hashes_detect_each_changed_implementation_file(self):
+        # Use isolated files so this test never changes a live source tree.
+        with tempfile.TemporaryDirectory() as directory:
+            source_dir = Path(directory)
+            for name in completion_core._CALIBRATION_SOURCE_FILES:
+                (source_dir / name).write_text("# original " + name, encoding="utf-8")
+            core_path = source_dir / "MorphoWeaveShapeCompletionCore.py"
+            with mock.patch.object(completion_core, "__file__", str(core_path)):
+                profile, kwargs = self._profile_fixture()
+                self.assertIsNotNone(select_calibration_entry(profile, **kwargs)[0])
+                for name in completion_core._CALIBRATION_SOURCE_FILES:
+                    with self.subTest(source=name):
+                        path = source_dir / name
+                        original = path.read_bytes()
+                        path.write_bytes(original + b"\n# semantic change")
+                        selected, reason = select_calibration_entry(profile, **kwargs)
+                        self.assertIsNone(selected)
+                        self.assertIn("different completion or calibration source code", reason)
+                        path.write_bytes(original)
+                core_path.unlink()
+                selected, reason = select_calibration_entry(profile, **kwargs)
+                self.assertIsNone(selected)
+                self.assertIn("cannot read implementation source", reason)
+                with self.assertRaisesRegex(ValueError, "cannot read implementation source"):
+                    self._profile_fixture()
+
+    def test_provenance_hashes_are_stable_across_install_paths(self):
+        original = calibration_implementation_provenance("4.0.0")
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory)
+            for name in completion_core._CALIBRATION_SOURCE_FILES:
+                (destination / name).write_bytes((CORE_DIR / name).read_bytes())
+            with mock.patch.object(
+                completion_core, "__file__", str(destination / "MorphoWeaveShapeCompletionCore.py")
+            ):
+                relocated = calibration_implementation_provenance("4.0.0")
+        self.assertEqual(original, relocated)
 
     def test_calibration_entry_reports_scope_and_probability_status(self):
         accumulator = CalibrationAccumulator(0.6, False, "surface_distance")

@@ -1,8 +1,8 @@
 """Discoverable single/batch entry point around the uploaded fragment workflow.
 
-The numerical core is restored byte-for-byte from the user's working archive.
+The restored fragment-fitting pipeline is retained with targeted prior,
+calibration compatibility, and surface-distance correctness updates.
 This entry point handles deployment, synchronization, and the Optimize tab.
-The numerical fitting implementation and existing files are not reorganized.
 """
 import importlib
 import inspect
@@ -29,12 +29,13 @@ from Resources.Python.MorphoWeaveShapeCompletionBase import (
     MorphoWeaveShapeCompletionTest as _CompletionTest,
 )
 from Resources.Python.MorphoWeaveShapeCompletionBatch import ShapeCompletionBatchMixin, _link_controls
+from Resources.Python.MorphoWeaveShapeCompletionGeometry import closest_surface_points, triangle_surface
 
 RUSTCPD_REQUIREMENT = "rustcpd==4.0.0"
 
 
-# Optimize is deliberately implemented in this entry-point file. The existing
-# fragment fitter, calibration code, batch adapter, and exporters are unchanged.
+# Optimize is deliberately implemented in this entry-point file. Geometry
+# queries are shared with calibration; the fragment-fitting path stays in Base.
 OPTIMIZATION_PRESET_SCHEMA = "MorphoWeaveShapeCompletionHyperparameters"
 OPTIMIZATION_PRESET_VERSION = 1
 
@@ -162,21 +163,7 @@ def _optimize_pairs(complete_directory, fragment_directory="", landmark_director
 
 
 def _optimize_triangles(polydata):
-    triangle_filter = vtk.vtkTriangleFilter()
-    triangle_filter.SetInputData(polydata)
-    triangle_filter.PassVertsOff()
-    triangle_filter.PassLinesOff()
-    triangle_filter.Update()
-    output = vtk.vtkPolyData()
-    output.DeepCopy(triangle_filter.GetOutput())
-    if output.GetNumberOfPoints() < 3 or output.GetNumberOfPolys() < 1:
-        raise ValueError("Optimization needs triangle surfaces, not empty meshes or point clouds")
-    vertices = vtk_np.vtk_to_numpy(output.GetPoints().GetData()).astype(np.float64, copy=True)
-    offsets = vtk_np.vtk_to_numpy(output.GetPolys().GetOffsetsArray())
-    connectivity = vtk_np.vtk_to_numpy(output.GetPolys().GetConnectivityArray())
-    if not np.all(np.diff(offsets) == 3) or not np.all(np.isfinite(vertices)):
-        raise ValueError("Invalid triangulated surface")
-    return output, vertices, connectivity.reshape(-1, 3).astype(np.int64, copy=True)
+    return triangle_surface(polydata)
 
 
 def _optimize_surface_samples(vertices, triangles, count, rng, mask=None):
@@ -195,18 +182,8 @@ def _optimize_surface_samples(vertices, triangles, count, rng, mask=None):
 
 
 def _optimize_surface_distances(polydata, queries):
-    """Unsigned closest-triangle distances; do not require a closed surface."""
-    locator = vtk.vtkStaticCellLocator()
-    locator.SetDataSet(polydata)
-    locator.BuildLocator()
-    closest, cell, sub, squared = [0.0] * 3, vtk.reference(0), vtk.reference(0), vtk.reference(0.0)
-    distances = np.empty(len(queries), dtype=np.float64)
-    for index, point in enumerate(queries):
-        locator.FindClosestPoint(point, closest, cell, sub, squared)
-        distances[index] = np.sqrt(max(float(squared), 0.0))
-    if not np.all(np.isfinite(distances)):
-        raise ValueError("Nonfinite surface distances")
-    return distances
+    """Truth queries -> predicted triangles; not a bidirectional score."""
+    return closest_surface_points(polydata, queries)[1]
 
 
 def _optimize_paired_queries(complete, fragment, count, rng, tolerance_fraction):

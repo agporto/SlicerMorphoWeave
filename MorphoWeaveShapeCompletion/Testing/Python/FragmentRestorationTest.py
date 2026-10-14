@@ -53,7 +53,7 @@ class Control:
         self.currentIndex, self.node, self.enabled, self.blocked = 0, None, True, False
         self.entries = []
         for s in ('currentNodeChanged','currentPathChanged','valueChanged','toggled',
-                  'clicked','textChanged','currentIndexChanged'):
+                  'clicked','textChanged','currentIndexChanged','currentChanged'):
             setattr(self,s,Signal(self))
     def __getattr__(self, name):
         # Rendering-only Qt methods are deliberately not implemented here.
@@ -162,6 +162,7 @@ class FragmentRestorationTest(unittest.TestCase):
                  'Resources':types.ModuleType('Resources'),'Resources.Python':types.ModuleType('Resources.Python')}
         self.patcher=patch.dict(sys.modules,modules); self.patcher.start(); self.addCleanup(self.patcher.stop)
         core=load('Resources.Python.MorphoWeaveShapeCompletionCore',CORE); self.core=core
+        load('Resources.Python.MorphoWeaveShapeCompletionGeometry',ROOT/'Resources/Python/MorphoWeaveShapeCompletionGeometry.py')
         self.base=load('Resources.Python.MorphoWeaveShapeCompletionBase',BASE)
         self.runner=load('Resources.Python.MorphoWeaveCompletionBatch',ROOT/'Resources/Python/MorphoWeaveCompletionBatch.py')
         self.adapter=load('Resources.Python.MorphoWeaveShapeCompletionBatch',ROOT/'Resources/Python/MorphoWeaveShapeCompletionBatch.py')
@@ -308,7 +309,7 @@ class FragmentRestorationTest(unittest.TestCase):
         self.assertIs(w.batch_template_sparse.currentNode(),self.sparse)
         self.assertIs(w.batch_ssm_table.currentNode(),self.table)
     def test_tabs_and_advanced_defaults(self):
-        self.assertEqual([n for _,n in self.widget.tabs.entries],['Complete Shape','Batch','Calibration','Advanced'])
+        self.assertEqual([n for _,n in self.widget.tabs.entries],['Complete Shape','Batch','Optimize','Calibration','Advanced'])
         settings=self.widget._read_settings()
         self.assertEqual(settings.translation_anchor_count,6);self.assertEqual(settings.residual_scale_policy,'auto')
         self.assertEqual(settings.free_scale_bounds_fraction,0.1);self.assertEqual(settings.atlas_sigma2_from_pose_factor,2.0)
@@ -330,7 +331,7 @@ class FragmentRestorationTest(unittest.TestCase):
         source=inspect.getsource(self.entry.validate_completion_backend)
         for name in ('translation_anchor_count','scale_bounds','sigma2','adaptive_mixing','initial_sigma2','merge_tolerance'):
             self.assertIn('"'+name+'"',source)
-    def test_all_original_noninstaller_callables_are_preserved(self):
+    def test_unchanged_baseline_callables_are_preserved(self):
         manifest=json.loads((ROOT/'RESTORATION_PROVENANCE.json').read_text())
         found={}
         for node in ast.parse(BASE.read_text()).body:
@@ -338,9 +339,13 @@ class FragmentRestorationTest(unittest.TestCase):
             elif isinstance(node,ast.ClassDef):
                 for method in node.body:
                     if isinstance(method,ast.FunctionDef): found[node.name+'.'+method.name]=method
-        for name,expected in manifest['reference_callable_ast_sha256'].items():
+        source = BASE.read_text()
+        update = manifest['correctness_update']
+        for name, baseline_hash in update['baseline_callable_source_sha256'].items():
+            expected = update['intentional_changed_callables'].get(name, baseline_hash)
             with self.subTest(name=name):
-                self.assertEqual(hashlib.sha256(ast.dump(found[name],include_attributes=False).encode()).hexdigest(),expected)
+                segment = ast.get_source_segment(source, found[name])
+                self.assertEqual(hashlib.sha256(segment.encode()).hexdigest(), expected)
 
     def test_batch_files_are_identical_to_branch(self):
         manifest=json.loads((ROOT/'RESTORATION_PROVENANCE.json').read_text())
@@ -349,8 +354,9 @@ class FragmentRestorationTest(unittest.TestCase):
             actual=hashlib.sha1(b'blob '+str(len(content)).encode()+b'\0'+content).hexdigest()
             self.assertEqual(actual,expected)
 
-    def test_reference_core_hash_unchanged(self):
-        expected='aa936d91e962a0c14b1a7a7737df6330ce672f1c99291f43bcffce24f183b274'
+    def test_corrected_core_matches_documented_provenance(self):
+        manifest = json.loads((ROOT/'RESTORATION_PROVENANCE.json').read_text())
+        expected = manifest['correctness_update']['core_sha256']
         self.assertEqual(hashlib.sha256(CORE.read_bytes()).hexdigest(),expected)
 
 

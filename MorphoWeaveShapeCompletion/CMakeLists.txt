@@ -10,8 +10,11 @@ set(MODULE_PYTHON_RESOURCES
   TUTORIAL.md
   RESTORATION.md
   RESTORATION_PROVENANCE.json
+  VALIDATION_PROTOCOL.md
+  VALIDATION_MANIFEST.example.json
   Resources/Icons/${MODULE_NAME}.png
   Resources/Python/MorphoWeaveShapeCompletionCore.py
+  Resources/Python/MorphoWeaveShapeCompletionGeometry.py
   Resources/Python/MorphoWeaveShapeCompletionBase.py
   Resources/Python/MorphoWeaveShapeCompletionBatch.py
   Resources/Python/MorphoWeaveCompletionBatch.py
@@ -27,6 +30,8 @@ slicerMacroBuildScriptedModule(
 if(BUILD_TESTING)
   slicer_add_python_unittest(SCRIPT ${MODULE_NAME}.py)
   slicer_add_python_unittest(SCRIPT Testing/Python/ShapeCompletionCoreTest.py)
+  slicer_add_python_unittest(SCRIPT Testing/Python/ShapeCompletionGeometryTest.py)
   slicer_add_python_unittest(SCRIPT Testing/Python/ShapeCompletionModuleSourceTest.py)
   slicer_add_python_unittest(SCRIPT Testing/Python/FragmentRestorationTest.py)
+  slicer_add_python_unittest(SCRIPT Testing/Python/ShapeCompletionValidationTest.py)
 endif()

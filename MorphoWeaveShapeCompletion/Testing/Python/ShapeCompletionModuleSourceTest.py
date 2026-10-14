@@ -75,8 +75,10 @@ class ShapeCompletionModuleSourceTest(unittest.TestCase):
         self.assertIn("fragment = posed_surface[mask.indices]", calibration)
         self.assertNotIn("fragment = posed_truth", calibration)
         self.assertNotIn("fragment = posed_full", calibration)
-        self.assertIn("nearest_truth, errors_all = nearest_indices", calibration)
-        self.assertIn("~mask.contains(posed_surface[nearest_truth])", calibration)
+        self.assertIn("closest_truth, errors_all = closest_surface_points", calibration)
+        self.assertIn("surface_points=posed_surface", calibration)
+        self.assertIn("~mask.contains(closest_truth)", calibration)
+        self.assertNotIn("nearest_truth, errors_all = nearest_indices", calibration)
 
     def test_calibrated_uncertainty_names_make_scope_explicit(self):
         source = MODULE.read_text(encoding="utf-8")

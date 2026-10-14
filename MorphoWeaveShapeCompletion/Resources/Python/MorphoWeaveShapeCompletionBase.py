@@ -49,6 +49,10 @@ from Resources.Python.MorphoWeaveShapeCompletionCore import (
     save_calibration_profile,
     select_calibration_entry,
 )
+from Resources.Python.MorphoWeaveShapeCompletionGeometry import (
+    closest_surface_points,
+    triangle_surface,
+)
 
 
 SUPPORTED_MODEL_EXTENSIONS = (".ply", ".vtp", ".vtk", ".stl", ".obj")
@@ -565,12 +569,15 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
         atlas = qt.QFormLayout(atlas_box)
         layout.addRow(atlas_box)
         self.atlas_lambda = self._double(0.0, 1000.0, 5.0, 0.5, 4)
+        self.atlas_lambda.setToolTip(
+            "Completion requires a finite value greater than zero. rustcpd 4.0 cannot represent an exact flat posterior prior; zero is rejected before fitting."
+        )
         self.atlas_outlier = self._double(0.0, 0.95, 0.10, 0.01, 3)
         self.atlas_iterations = self._spin(1, 5000, 150)
         self.atlas_tolerance = self._double(1e-10, 1e-2, 1e-7, 1e-7, 10)
         self.atlas_k = self._spin(0, 1000, 0)
         self.atlas_k.setToolTip("0 uses the exact dense E-step; a positive value uses sparse k-nearest correspondences.")
-        atlas.addRow("Atlas SSM regularization:", self.atlas_lambda)
+        atlas.addRow("Atlas SSM regularization (> 0):", self.atlas_lambda)
         atlas.addRow("Atlas outlier weight:", self.atlas_outlier)
         atlas.addRow("Maximum iterations:", self.atlas_iterations)
         atlas.addRow("Tolerance:", self.atlas_tolerance)
@@ -1217,6 +1224,7 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
                 coverage=settings.coverage,
                 landmark_mode=bool(landmarks is not None and settings.use_landmarks),
                 current_settings=self._settings_snapshot(settings),
+                backend_version=getattr(rustcpd, "__version__", None),
             )
         pointwise_radius = (
             calibrated_radius(result.total_variance, profile_entry)
@@ -1421,6 +1429,12 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
                         f"{compatibility['median_fraction'] * 100:.3f}% of diagonal."
                     )
                     truth_type = "exact_dense_correspondence"
+                complete_polydata = None
+                if truth_type == "surface_distance":
+                    complete_polydata = self.logic.model_polydata_world(mesh_node)
+                    # Validate before fitting; point-cloud-only references are
+                    # allowed for paired dense truth but are not surface truth.
+                    triangle_surface(complete_polydata)
                 target_labels = target_sparse_points = None
                 landmark_path = landmark_index.get(key)
                 if requested_landmarks:
@@ -1527,13 +1541,17 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
                                     else ~mask.contains(posed_truth)
                                 )
                             else:
-                                nearest_truth, errors_all = nearest_indices(
-                                    posed_surface, result.completed_points
+                                # Calibration is predicted dense loci -> complete
+                                # truth triangles (Optimize uses the reverse
+                                # direction, truth queries -> predicted surface).
+                                closest_truth, errors_all = closest_surface_points(
+                                    complete_polydata, result.completed_points,
+                                    surface_points=posed_surface,
                                 )
                                 missing_mask = (
                                     np.ones(len(result.completed_points), dtype=bool)
                                     if np.isclose(float(coverage), 1.0)
-                                    else ~mask.contains(posed_surface[nearest_truth])
+                                    else ~mask.contains(closest_truth)
                                 )
                             if not np.any(missing_mask):
                                 # Extremely distorted failures can place every completed
@@ -1638,6 +1656,7 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
                 f"target_landmarks={self.calibration_landmark_directory.currentPath or 'none'}"
             ),
             settings_snapshot=settings_snapshot,
+            backend_version=getattr(rustcpd, "__version__", None),
         )
         profile["generation_summary"] = {
             "requested_fragment_count": int(total),

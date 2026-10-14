@@ -13,7 +13,13 @@ import numpy as np
 
 DEFAULT_COVERAGE = 1.0
 LANDMARK_RECOMMENDED_BELOW = 0.75
-PROFILE_VERSION = 1
+PROFILE_VERSION = 2
+CALIBRATION_ALGORITHM_VERSION = "2-rustcpd4-prior-precision-surface-distance"
+_CALIBRATION_SOURCE_FILES = (
+    "MorphoWeaveShapeCompletionCore.py",
+    "MorphoWeaveShapeCompletionBase.py",
+    "MorphoWeaveShapeCompletionGeometry.py",
+)
 _TINY = 1e-12
 
 
@@ -137,8 +143,13 @@ class CompletionSettings:
             raise ValueError("coarse_survivor_count must cover the finalists")
         if self.refine_source_count is not None and int(self.refine_source_count) < 1:
             raise ValueError("refine_source_count must be positive or None")
-        if self.pose_lambda < 0 or self.atlas_lambda < 0:
-            raise ValueError("regularization strengths must be non-negative")
+        if not math.isfinite(float(self.pose_lambda)) or float(self.pose_lambda) < 0:
+            raise ValueError("pose_lambda must be finite and non-negative")
+        if not math.isfinite(float(self.atlas_lambda)) or float(self.atlas_lambda) <= 0:
+            raise ValueError(
+                "atlas_lambda must be finite and positive for completion: "
+                "rustcpd 4.0 does not support an exact zero-strength (flat) posterior prior."
+            )
         if not 0 <= self.pose_outlier_weight < 1 or not 0 <= self.atlas_outlier_weight < 1:
             raise ValueError("outlier weights must be in [0, 1)")
         if not 0 < self.identity_prior_probability < 1:
@@ -516,6 +527,72 @@ def calibration_method_signature(settings: Mapping[str, Any] | CompletionSetting
     canonical = {key: values[key] for key in sorted(values) if key not in excluded}
     payload = json.dumps(_jsonable(canonical), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def calibration_implementation_provenance(backend_version: Optional[str]) -> dict[str, Any]:
+    """Identify the implementation that produced calibration or inference.
+
+    The caller supplies the actual imported rustcpd version, rather than the
+    module's dependency requirement. Source hashes cover inference, calibration
+    orchestration, and surface scoring, without importing Slicer or rustcpd.
+    Hash keys are relative filenames so relocating an unchanged install is safe.
+    Missing source or backend identity fails closed instead of allowing an
+    unverifiable profile to supply calibrated radii or probabilities.
+    """
+    if not isinstance(backend_version, str) or not backend_version.strip() or (
+        backend_version.strip().lower() == "unknown"
+    ):
+        raise ValueError("Calibration provenance requires the actual rustcpd backend version.")
+    source_hashes = {}
+    for name in _CALIBRATION_SOURCE_FILES:
+        path = Path(__file__).resolve().parent / name
+        try:
+            source_hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as error:
+            raise ValueError(
+                f"Calibration provenance cannot read implementation source {name}."
+            ) from error
+    return {
+        "rustcpd_version": backend_version.strip(),
+        "algorithm_version": CALIBRATION_ALGORITHM_VERSION,
+        "source_sha256": source_hashes,
+    }
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _calibration_profile_error(profile: Mapping[str, Any]) -> Optional[str]:
+    """Check required identity fields even for profiles not loaded from disk."""
+    if profile.get("schema") != "MorphoWeaveShapeCompletionCalibration":
+        return "Not a MorphoWeave shape-completion calibration profile."
+    if profile.get("version") != PROFILE_VERSION:
+        return "Unsupported calibration profile version; regenerate the calibration profile."
+    if not _is_sha256(profile.get("method_signature_sha256")):
+        return "Calibration profile is missing a valid settings signature; regenerate it."
+    provenance = profile.get("implementation_provenance")
+    if not isinstance(provenance, Mapping):
+        return "Calibration profile is missing implementation provenance; regenerate it."
+    version = provenance.get("rustcpd_version")
+    if not isinstance(version, str) or not version.strip() or version.strip().lower() == "unknown":
+        return "Calibration profile is missing rustcpd backend provenance; regenerate it."
+    if not isinstance(provenance.get("algorithm_version"), str) or not provenance["algorithm_version"]:
+        return "Calibration profile is missing algorithm provenance; regenerate it."
+    hashes = provenance.get("source_sha256")
+    if (
+        not isinstance(hashes, Mapping)
+        or set(hashes) != set(_CALIBRATION_SOURCE_FILES)
+        or not all(_is_sha256(value) for value in hashes.values())
+    ):
+        return "Calibration profile is missing valid implementation source hashes; regenerate it."
+    if not isinstance(profile.get("entries"), list):
+        return "Calibration profile has no entries."
+    return None
 
 
 def model_fingerprint(mean: np.ndarray, modes: np.ndarray, eigenvalues: np.ndarray) -> str:
@@ -1005,14 +1082,11 @@ def run_completion(
         working_modes_flat,
         ssm.eigenvalues,
         completeness=float(settings.coverage),
-        # Atlas registration adds λ·Λ⁻¹ to the coefficient precision after
-        # division by σ_eff². ShapePosterior parameterizes that same prior as
-        # (temperature·Λ)⁻¹, so the matching temperature is 1/λ.
-        prior_temperature=(
-            1.0 / float(settings.atlas_lambda)
-            if float(settings.atlas_lambda) > _TINY
-            else 1e12
-        ),
+        # In pinned rustcpd 4.0, both registration's lambda and posterior's
+        # prior_temperature multiply Λ⁻¹ in coefficient precision. They must
+        # match, not be reciprocals. validate() rejects the unsupported exact
+        # flat-prior case before any native fitting, without silently clamping.
+        prior_temperature=float(settings.atlas_lambda),
         outlier_weight=float(settings.atlas_outlier_weight),
         estimate_discrepancy=bool(settings.estimate_discrepancy),
     )
@@ -1701,6 +1775,7 @@ def build_calibration_profile(
     generated_from_ssm_training_set: bool,
     source_description: str,
     settings_snapshot: Mapping[str, Any],
+    backend_version: Optional[str],
 ) -> dict[str, Any]:
     warning = (
         "Internal calibration: these complete meshes were used to fit the SSM. Intervals and probabilities may be optimistic for new specimens."
@@ -1713,6 +1788,7 @@ def build_calibration_profile(
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "model_fingerprint_sha256": str(fingerprint),
         "method_signature_sha256": calibration_method_signature(settings_snapshot),
+        "implementation_provenance": calibration_implementation_provenance(backend_version),
         "generated_from_ssm_training_set": bool(generated_from_ssm_training_set),
         "calibration_scope_warning": warning,
         "source_description": str(source_description),
@@ -1729,12 +1805,11 @@ def save_calibration_profile(profile: Mapping[str, Any], path: str | Path) -> No
 
 def load_calibration_profile(path: str | Path) -> dict[str, Any]:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
-    if data.get("schema") != "MorphoWeaveShapeCompletionCalibration":
+    if not isinstance(data, Mapping):
         raise ValueError("not a MorphoWeave shape-completion calibration profile")
-    if int(data.get("version", -1)) != PROFILE_VERSION:
-        raise ValueError("unsupported calibration profile version")
-    if not isinstance(data.get("entries"), list):
-        raise ValueError("calibration profile has no entries")
+    error = _calibration_profile_error(data)
+    if error is not None:
+        raise ValueError(error)
     return data
 
 
@@ -1745,15 +1820,30 @@ def select_calibration_entry(
     coverage: float,
     landmark_mode: bool,
     current_settings: Optional[Mapping[str, Any] | CompletionSettings] = None,
+    backend_version: Optional[str] = None,
     max_coverage_delta: float = 0.05,
 ) -> tuple[Optional[dict[str, Any]], str]:
+    error = _calibration_profile_error(profile)
+    if error is not None:
+        return None, error
     if profile.get("model_fingerprint_sha256") != fingerprint:
         return None, "Calibration profile belongs to a different SSM."
-    if current_settings is not None:
-        expected_signature = profile.get("method_signature_sha256")
-        current_signature = calibration_method_signature(current_settings)
-        if expected_signature and expected_signature != current_signature:
-            return None, "Calibration profile was generated with different completion or uncertainty settings."
+    if current_settings is None:
+        return None, "Current completion settings are required to verify calibration compatibility."
+    current_signature = calibration_method_signature(current_settings)
+    if profile["method_signature_sha256"] != current_signature:
+        return None, "Calibration profile was generated with different completion or uncertainty settings."
+    try:
+        current_provenance = calibration_implementation_provenance(backend_version)
+    except ValueError as error:
+        return None, str(error)
+    expected_provenance = profile["implementation_provenance"]
+    if expected_provenance["rustcpd_version"] != current_provenance["rustcpd_version"]:
+        return None, "Calibration profile was generated with a different rustcpd backend version; regenerate it."
+    if expected_provenance["algorithm_version"] != current_provenance["algorithm_version"]:
+        return None, "Calibration profile was generated with a different completion algorithm; regenerate it."
+    if expected_provenance["source_sha256"] != current_provenance["source_sha256"]:
+        return None, "Calibration profile was generated with different completion or calibration source code; regenerate it."
     candidates = [
         dict(entry)
         for entry in profile.get("entries", [])
