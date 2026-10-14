@@ -291,7 +291,8 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
     {"key":"targetCoverage","kind":"dspin","label":"Target completeness (linear fraction)","section":"General Settings", "min":0.05,"max":1.0,"step":0.01,"value":1.0,"decimals":2},
     {"key":"registrationPointCount","kind":"spin","label":"Target registration points","section":"Point sampling and max projection","min":100,"max":1_000_000,"step":100,"value":2000,
      "tooltip":"Target size for temporary registration clouds. Values below 1,600 limit Pose-EM refinement."},
-    {"key":"projectionFactor","kind":"slider","label":"Max projection factor (%)","section":"Point sampling and max projection","min":0,"max":10,"step":0.1,"value":1.0},
+    {"key":"projectionFactor","kind":"slider","label":"Max projection factor (%)","section":"Point sampling and max projection","min":0,"max":10,"step":0.1,"value":1.0,
+     "tooltip":"Maximum final landmark movement as a percent of target size. If the surface is farther away, retain the original landmark."},
     {"key":"normalSearchRadius","kind":"slider","label":"Normal search radius","section":"Rigid registration","min":2,"max":12,"step":1,"value":2},
     {"key":"FPFHSearchRadius","kind":"slider","label":"FPFH search radius","section":"Rigid registration","min":3,"max":20,"step":1,"value":5},
     {"key":"distanceThreshold","kind":"slider","label":"RANSAC distance threshold","section":"Rigid registration","min":0.5,"max":4.0,"step":0.25,"value":1.5},
@@ -300,7 +301,8 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
     {"key":"ICPDistanceThreshold","kind":"slider","label":"ICP distance threshold","section":"Rigid registration","min":0.1,"max":2.0,"step":0.1,"value":0.4},
     {"key":"useBiharmonic","kind":"check","label":"Experimental: Use biharmonic surface warp","section":"Deformation backend","value":False},
     {"key":"bih_lam","kind":"dspin","label":"Biharmonic stiffness (lambda)","section":"Deformation backend","min":1.0,"max":1000000.0,"step":100.0,"value":10000.0},
-    {"key":"tpsLambda","kind":"dspin","label":"TPS smoothing (λ)","section":"Deformation backend","min":0.0,"max":10.0,"step":0.01,"value":0.0},
+    {"key":"tpsLambda","kind":"dspin","label":"TPS smoothing (λ)","section":"Deformation backend","min":0.0,"max":10.0,"step":0.01,"value":0.0,
+     "tooltip":"Zero interpolates controls; increasing positive values damps non-affine deformation toward an affine fit."},
     {"key":"tpsMaxCorr","kind":"spin","label":"TPS max constraints","section":"Deformation backend","min":20,"max":5000,"step":20,"value":800},
     {"key":"alpha","kind":"dspin","label":"Rigidity (alpha)","section":"PCA-CPD registration","min":0.1,"max":10.0,"step":0.1,"value":2.0},
     {"key":"beta","kind":"dspin","label":"Motion coherence (beta)","section":"PCA-CPD registration","min":0.1,"max":10.0,"step":0.1,"value":2.0},
@@ -981,13 +983,14 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
         last_ui_pump[0] = now
     def cancel_cb(): return self._cancelBatch
     qt.QApplication.setOverrideCursor(qt.Qt.WaitCursor)
+    result = None
     try:
       batchParameters = self._optimization_parameters()
       saveWarpedMeshes = bool(self.saveWarpedMeshesBatchChk.checked)
       meshOutputDir = self.meshOutputSelector.currentPath if saveWarpedMeshes else ""
       smoothExportedMesh = bool(self.smoothExportedMeshesBatchChk.checked)
 
-      logic.runLandmarkBatch(
+      result = logic.runLandmarkBatch(
         sourceModelNode=self.sourceModelMultiSelector.currentNode(),
         sourceCorrNode=self.sourceFiducialMultiSelector.currentNode(),
         sourceLMNode=self.sourceSparseFiducialMultiSelector.currentNode(),
@@ -1004,12 +1007,20 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
         status_callback=status_cb,
         cancel_callback=cancel_cb
       )
+    except Exception as exc:
+      logging.exception("Landmark Transfer batch failed.")
+      slicer.util.errorDisplay(f"Batch failed: {exc}")
     finally:
       qt.QApplication.restoreOverrideCursor(); self.batchCancelButton.enabled=False
-      if not self._cancelBatch:
-        self.batchProgress.setValue(100); slicer.util.showStatusMessage("Batch processing complete.", 3000)
-      else:
-        slicer.util.showStatusMessage("Batch cancelled.", 3000)
+    if result is not None:
+      if result["total"] and result["attempted"] == result["total"]:
+        self.batchProgress.setValue(100)
+      summary = logic.batchResultMessage(result)
+      slicer.util.showStatusMessage(summary, 5000)
+      if result["failed"] or result.get("error") or result["warnings"]:
+        details = [f"{entry['target']}: {entry['error']}" for entry in result["failures"]]
+        details.extend(result["warnings"])
+        slicer.util.warningDisplay(summary + ("\n" + "\n".join(details) if details else ""))
 
   # ----- Optimization -----
   def onOptimize(self):
@@ -1116,7 +1127,32 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
     self.rigidTransformNode=None
     self._ssm_cache={}
 
+  @staticmethod
+  def batchResultMessage(result):
+    if result.get("error"):
+      prefix = "Batch stopped: " + result["error"] + "."
+    elif result["cancelled"]:
+      prefix = "Batch cancelled."
+    elif result["total"] == 0:
+      return "No target meshes found in the selected folder."
+    elif result["failed"]:
+      prefix = "Batch finished with failures."
+    else:
+      prefix = "Batch complete."
+    message = (f"{prefix} {result['succeeded']} succeeded, {result['failed']} failed; "
+               f"{result['attempted']}/{result['total']} attempted.")
+    if result["warnings"]:
+      message += f" {len(result['warnings'])} output warning(s)."
+    return message
+
   def runLandmarkBatch(self, sourceModelNode, sourceCorrNode, sourceLMNode, targetModelDir, outputDir, skipScaling, projectionFactor, parameters, tableNode, saveWarpedMeshes=False, meshOutputDir="", smoothExportedMesh=False, progress_callback=None, status_callback=None, cancel_callback=None):
+    """Return counts, successful output paths and per-target errors.
+
+    A success requires all requested specimen outputs. Cancellation inside an
+    item counts as attempted, not failed, and is recorded in cancelled_count;
+    unprocessed is the number of targets never started. Successfully written
+    files are retained and listed even if a later output for that target fails.
+    """
     import tiny3d as t3d
     t3d.utility.random.seed(int(42))
     parameters = dict(parameters)
@@ -1133,6 +1169,7 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
     ssmData = self._get_ssm_base(tableNode) if tableNode is not None else None
 
     if tableNode is None: raise ValueError("Batch requires an SSM table.")
+    if sourceModelNode is None: raise ValueError("Batch requires a template model.")
     if sourceCorrNode is None: raise ValueError("Batch requires template correspondences.")
     if sourceLMNode   is None: raise ValueError("Batch requires template landmarks.")
     os.makedirs(outputDir, exist_ok=True)
@@ -1140,11 +1177,17 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
       if not meshOutputDir:
         raise ValueError("Batch mesh export requires a warped mesh output directory.")
       os.makedirs(meshOutputDir, exist_ok=True)
-    targets=[f for f in os.listdir(targetModelDir) if f.lower().endswith((".ply",".vtp",".vtk",".stl",".obj"))]
+    targets=sorted(f for f in os.listdir(targetModelDir) if f.lower().endswith((".ply",".vtp",".vtk",".stl",".obj")))
+    stems = [os.path.splitext(f)[0].casefold() for f in targets]
+    if len(stems) != len(set(stems)):
+      raise ValueError("Target meshes must have unique output stems (case-insensitive).")
     total=len(targets); done=0; pose_diagnostics=[]
+    result = dict(total=total, attempted=0, succeeded=0, failed=0, cancelled=False,
+                  cancelled_count=0, unprocessed=total, failures=[], outputs=[], warnings=[])
     if total==0:
-      if status_callback: status_callback("No target meshes found in the selected folder.")
-      if progress_callback: progress_callback(0,1,"No work"); return
+      if status_callback: status_callback(self.batchResultMessage(result))
+      if progress_callback: progress_callback(0,1,"No work")
+      return result
     app=slicer.app
     try:
       prev_render = app.isRenderPaused()
@@ -1154,26 +1197,34 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
     def _apply_pd_transform(pd, T): return transform_polydata(pd, T)
     def _mat4(M): return as_np4x4(M)
     def _apply_M_to_np(P, M4): P=np.asarray(P, np.float32); M4=_mat4(M4); Ph=np.c_[P, np.ones((len(P),1), np.float32)]; return (Ph @ M4.T)[:, :3]
-    tpl_model = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLModelNode','_tmp_tpl_model'); tpl_model.SetAttribute('fastmorph.temp','1')
-    tpl_corr  = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsFiducialNode','_tmp_tpl_corr'); tpl_corr.SetAttribute('fastmorph.temp','1')
-    tpl_lm    = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsFiducialNode','_tmp_tpl_lm'); tpl_lm.SetAttribute('fastmorph.temp','1')
-    save_scratch = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsFiducialNode','_tmp_save'); save_scratch.SetAttribute('fastmorph.temp','1')
-    for n in (tpl_model, tpl_corr, tpl_lm, save_scratch):
-      dn=n.GetDisplayNode()
-      if dn:
-        dn.SetVisibility(False)
-        if hasattr(dn,'SetPointLabelsVisibility'): dn.SetPointLabelsVisibility(False)
-    tpl_model_orig=vtk.vtkPolyData(); tpl_model_orig.DeepCopy(sourceModelNode.GetPolyData())
-    tpl_corr_orig =slicer.util.arrayFromMarkupsControlPoints(sourceCorrNode).astype(np.float32,copy=True)
-    tpl_lm_orig   =slicer.util.arrayFromMarkupsControlPoints(sourceLMNode).astype(np.float32,copy=True)
+    tpl_model = tpl_corr = tpl_lm = save_scratch = None
     try:
+      tpl_model = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLModelNode','_tmp_tpl_model'); tpl_model.SetAttribute('fastmorph.temp','1')
+      tpl_corr  = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsFiducialNode','_tmp_tpl_corr'); tpl_corr.SetAttribute('fastmorph.temp','1')
+      tpl_lm    = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsFiducialNode','_tmp_tpl_lm'); tpl_lm.SetAttribute('fastmorph.temp','1')
+      save_scratch = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsFiducialNode','_tmp_save'); save_scratch.SetAttribute('fastmorph.temp','1')
+      for n in (tpl_model, tpl_corr, tpl_lm, save_scratch):
+        dn=n.GetDisplayNode()
+        if dn:
+          dn.SetVisibility(False)
+          if hasattr(dn,'SetPointLabelsVisibility'): dn.SetPointLabelsVisibility(False)
+      tpl_model_orig=vtk.vtkPolyData(); tpl_model_orig.DeepCopy(sourceModelNode.GetPolyData())
+      tpl_corr_orig =slicer.util.arrayFromMarkupsControlPoints(sourceCorrNode).astype(np.float32,copy=True)
+      tpl_lm_orig   =slicer.util.arrayFromMarkupsControlPoints(sourceLMNode).astype(np.float32,copy=True)
       if progress_callback: progress_callback(0, total, "Starting…")
       for i,fname in enumerate(targets):
-        if cancel_callback and cancel_callback(): logging.info("Batch cancel requested."); break
+        if cancel_callback and cancel_callback():
+          logging.info("Batch cancel requested.")
+          result["cancelled"] = True
+          break
+        result["attempted"] += 1
+        result["unprocessed"] = total - result["attempted"]
+        item_outputs = []
         tgt_node = pred_node = None; pose_entry = None
         try:
           tgt_path=os.path.join(targetModelDir,fname)
           if status_callback: status_callback(f"[{i+1}/{total}] Load target")
+          if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
           tgt_node=slicer.util.loadModel(tgt_path)
           if tgt_node is None or tgt_node.GetPolyData() is None: raise RuntimeError(f"Failed to load: {tgt_path}")
           dn=tgt_node.GetDisplayNode();
@@ -1189,6 +1240,7 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
             if pose_em:
               if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
               if status_callback: status_callback(f"[{i+1}/{total}] Pose EM template-shape optimization…")
+              if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
               pose_result = self.initialize_template_pose_em(
                 tableNode, tpl_model, tpl_corr, tpl_lm, tgt_node,
                 parameters=parameters,
@@ -1220,6 +1272,7 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
                 )
             else:
               if status_callback: status_callback(f"[{i+1}/{total}] Optimize (SSM+RANSAC)…")
+              if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
               k = int(parameters.get("opt_pcGridSteps", 4))
               rper = int(parameters.get("opt_ransac_per_cand", 300000))
               _b,_T=self.initialize_template(tableNode, tpl_model, tpl_corr, tpl_lm, tgt_node, parameters=parameters, k=k, span=3.0, optimizer="powell", max_evals=240, eval_ransac_iters=int(0.2 * rper), final_ransac_iters=rper, seed=0, ssmData=ssmData)
@@ -1250,9 +1303,12 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
             with slicer.util.NodeModify(tpl_lm):   slicer.util.updateMarkupsControlPointsFromArray(tpl_lm,   lm_np)
           if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
           if status_callback: status_callback(f"[{i+1}/{total}] Subsample & features…")
+          if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
           _src_pc,_tgt_pc,src_down,tgt_down,src_fpfh,tgt_fpfh,voxel=self.runSubsample(tpl_model, tgt_node, skipScaling, parameters)
           if status_callback: status_callback(f"[{i+1}/{total}] RANSAC+ICP rigid…")
+          if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
           M_icp=_mat4(self.estimateTransform(src_down, tgt_down, src_fpfh, tgt_fpfh, voxel, parameters))
+          if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
           if need_final_mesh or use_bih:
             tpl_model.SetAndObservePolyData(_apply_pd_transform(tpl_model.GetPolyData(), M_icp))
           corr_np=_apply_M_to_np(corr_np, M_icp); lm_np=_apply_M_to_np(lm_np, M_icp)
@@ -1261,6 +1317,7 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
             with slicer.util.NodeModify(tpl_lm):   slicer.util.updateMarkupsControlPointsFromArray(tpl_lm,   lm_np)
           if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
           if status_callback: status_callback(f"[{i+1}/{total}] PCA-CPD deformable…")
+          if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
           aligned_corr=corr_np
           deformed_corr=self.runDeformable(tableNode=tableNode, sourceLM=aligned_corr, scale=s, targetSLM=np.asarray(tgt_down.points), parameters=parameters, rigidMatrix=M_icp, ssmData=ssmData)
           if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
@@ -1286,35 +1343,50 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
           else:
               pred_np = self.warp_points_tps(lm_np, aligned_corr, deformed_corr, lam=lam_tps, max_corr=max_corr, seed=0).astype(np.float32, copy=False)
 
+          if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
           if projection_enabled:
             if status_callback: status_callback(f"[{i+1}/{total}] Project to surface…")
+            if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
             pred_node=self.runPointProjection(tpl_model, tgt_node, tpl_lm, projectionFactor)
             self.propagateLandmarkTypes(sourceLMNode, pred_node)
             pred_np=slicer.util.arrayFromMarkupsControlPoints(pred_node).astype(np.float32,copy=False)
           elif pred_np is None:
             self.propagateLandmarkTypes(sourceLMNode, tpl_lm)
             pred_np=slicer.util.arrayFromMarkupsControlPoints(tpl_lm).astype(np.float32,copy=False)
+          if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
           root=os.path.splitext(fname)[0]
           if saveWarpedMeshes:
             if status_callback: status_callback(f"[{i+1}/{total}] Save warped mesh…")
+            if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
             mesh_pd = tpl_model.GetPolyData()
             if mesh_pd.GetNumberOfPoints() == 0:
               raise RuntimeError("Warped mesh is empty; cannot save batch mesh output.")
             if smoothExportedMesh:
               mesh_pd = self.smoothPolyData(mesh_pd)
-            self.savePolyDataVTP(mesh_pd, os.path.join(meshOutputDir, root + ".vtp"))
+            mesh_path = os.path.join(meshOutputDir, root + ".vtp")
+            self.savePolyDataVTP(mesh_pd, mesh_path)
+            result["outputs"].append(mesh_path); item_outputs.append(mesh_path)
           out_path=os.path.join(outputDir, root+".mrk.json")
           if status_callback: status_callback(f"[{i+1}/{total}] Save landmarks…")
+          if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
           with slicer.util.NodeModify(save_scratch):
             slicer.util.updateMarkupsControlPointsFromArray(save_scratch, pred_np)
           self.propagateLandmarkTypes(sourceLMNode, save_scratch)
-          slicer.util.saveNode(save_scratch, out_path)
+          if (not slicer.util.saveNode(save_scratch, out_path)
+              or not os.path.isfile(out_path) or os.path.getsize(out_path) == 0):
+            raise RuntimeError(f"Failed to save landmarks: {out_path}")
+          result["outputs"].append(out_path); item_outputs.append(out_path)
+          result["succeeded"] += 1
           if pose_entry is not None:
             pose_entry["landmarks"] = os.path.basename(out_path)
             pose_diagnostics.append(pose_entry)
         except KeyboardInterrupt:
+          result["cancelled"] = True
+          result["cancelled_count"] += 1
           logging.info(f"[batch] Cancelled during {fname}"); raise
         except Exception as e:
+          result["failed"] += 1
+          result["failures"].append(dict(target=fname, error=str(e), outputs=list(item_outputs)))
           logging.error(f"[batch] Failed on {fname}: {e}")
         finally:
           for n in (pred_node, tgt_node):
@@ -1322,22 +1394,23 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
               try: scene.RemoveNode(n)
               except: pass
           done += 1
-          if progress_callback: progress_callback(done,total,f"Done {done}/{total}")
-      if status_callback and done==total: status_callback("Batch processing complete.")
+          if progress_callback:
+            progress_callback(done,total,f"{result['succeeded']} succeeded, {result['failed']} failed; {done}/{total} attempted")
     except KeyboardInterrupt:
+      result["cancelled"] = True
       logging.info(f"[batch] Cancelled at {done}/{total}")
       if progress_callback: progress_callback(done,total,f"Cancelled at {done}/{total}")
-      if status_callback: status_callback("Batch cancelled.")
     except Exception as e:
+      result["error"] = str(e)
       logging.exception("Batch crashed.")
-      if status_callback: status_callback(f"Batch error: {e}")
     finally:
       if pose_diagnostics:
         diagnostics_path = os.path.join(outputDir, "pose_em_diagnostics.json")
         try:
           with open(diagnostics_path, "w", encoding="utf-8") as stream:
             json.dump(pose_diagnostics, stream, indent=2, sort_keys=True)
-        except Exception:
+        except Exception as exc:
+          result["warnings"].append(f"Could not save pose-EM diagnostics: {diagnostics_path}: {exc}")
           logging.exception(f"Could not save pose-EM diagnostics: {diagnostics_path}")
       for n in (tpl_model, tpl_corr, tpl_lm, save_scratch):
         if n:
@@ -1348,6 +1421,8 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
       except:
         try: app.setRenderPaused(False)
         except: pass
+    if status_callback: status_callback(self.batchResultMessage(result))
+    return result
 
   def _tableToArray(self, tableNode):
     vtk_table = tableNode.GetTable(); n_rows = vtk_table.GetNumberOfRows(); n_cols = vtk_table.GetNumberOfColumns()
@@ -1526,7 +1601,8 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
       writer = vtk.vtkXMLPolyDataWriter()
       writer.SetFileName(outputPath)
       writer.SetInputData(polyData)
-      if writer.Write() != 1:
+      if (writer.Write() != 1 or writer.GetErrorCode() != 0
+          or not os.path.isfile(outputPath) or os.path.getsize(outputPath) == 0):
           raise RuntimeError(f"Failed to save warped mesh: {outputPath}")
 
   def runDeformable(self, tableNode, sourceLM, scale, targetSLM, parameters, rigidMatrix=None, ssmData=None):
@@ -1573,6 +1649,10 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
 
       d_tgt = _diag(np.asarray(targetSLM)); s20 = 20.0/max(d_tgt,1e-12)
       src_n = np.asarray(sourceLM)*s20; tgt_n = np.asarray(targetSLM)*s20
+      # Transport mode displacements through the same source prescale and
+      # external normalization as the mean. R already includes its full linear
+      # block; coefficients/eigenvalues retain their original units.
+      U_aligned *= float(scale) * s20
 
       cov = float(parameters.get("targetCoverage", 1.0))
       is_complete = abs(cov - 1.0) < 1e-6   # or: np.isclose(cov, 1.0)
@@ -1651,13 +1731,13 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
       # Rows/Cols indices
       ii = F[:, [1, 2, 0]].ravel()
       jj = F[:, [2, 0, 1]].ravel()
-      data = np.concatenate([c0, c1, c2]) # Corresponding cotangents
+      data = np.column_stack([c0, c1, c2]).ravel()  # same face-major order as ii/jj
 
       # Use coo_matrix to handle duplicate entries (summing them automatically)
       # We need both (i,j) and (j,i) symmetric entries
       rows = np.concatenate([ii, jj])
       cols = np.concatenate([jj, ii])
-      vals = np.concatenate([data, data]) * 0.5
+      vals = np.concatenate([data, data])  # c0/c1/c2 already contain half-cotangents
 
       n = V.shape[0]
       L = sparse.coo_matrix((vals, (rows, cols)), shape=(n, n)).tocsr()
@@ -1675,62 +1755,74 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
       return L, M
 
   def warp_model_biharmonic(self, modelNode, src_corr, dst_corr, lam=1e4):
-      """
-      Solve (L^T M^{-1} L + lam*W) X = lam*W*target  for X (per coordinate),
-      where W has 1's at constrained (nearest) vertices to src_corr.
+      """Smooth displacements, not absolute positions, using soft controls.
+
+      Each source control is snapped to its nearest vertex and contributes
+      dst-src there, preserving its original offset from that vertex. Duplicate
+      controls are averaged with one unit penalty per constrained vertex.
+      Components with no controls are left unchanged.
       """
       from scipy.spatial import cKDTree
       from scipy.sparse import diags
+      from scipy.sparse.csgraph import connected_components
       from scipy.sparse.linalg import splu
       import vtk.util.numpy_support as vtk_np
 
+      src_corr = np.asarray(src_corr, np.float64)
+      dst_corr = np.asarray(dst_corr, np.float64)
+      if src_corr.ndim != 2 or src_corr.shape[1] != 3 or src_corr.shape != dst_corr.shape:
+          raise ValueError("Biharmonic controls must have matching shape (N,3)")
+      if not np.isfinite(src_corr).all() or not np.isfinite(dst_corr).all():
+          raise ValueError("Biharmonic controls must be finite")
+      if not np.isfinite(lam) or lam <= 0:
+          raise ValueError("Biharmonic lambda must be finite and positive")
 
-      # Triangulate and extract (V, F)
       tri = self._triangulate_polydata(modelNode.GetPolyData())
-      V0 = vtk_np.vtk_to_numpy(tri.GetPoints().GetData()).astype(np.float64, copy=False)
+      if tri.GetNumberOfPoints() == 0:
+          raise ValueError("Biharmonic warp requires a non-empty mesh")
+      V0 = vtk_np.vtk_to_numpy(tri.GetPoints().GetData()).astype(np.float64, copy=True)
       ca = vtk_np.vtk_to_numpy(tri.GetPolys().GetData())
       F = ca.reshape(-1, 4)[:, 1:4].astype(np.int64, copy=False)
+      if len(src_corr) == 0:
+          return V0, V0.copy(), F
 
-
-      # Biharmonic operator
       L, M = self._cotangent_laplacian(V0, F)
-      from scipy.sparse import diags
       Minv = diags(1.0 / np.maximum(M.diagonal(), 1e-12))
       A0 = (L.T @ Minv @ L).tocsr()
-
-      # Map correspondences to nearest vertices (deduplicate)
-      tree = cKDTree(V0)
-      idx_raw = tree.query(np.asarray(src_corr, np.float64), k=1)[1]
+      idx_raw = cKDTree(V0).query(src_corr, k=1)[1]
       idx_unique, inv = np.unique(idx_raw, return_inverse=True)
-
-      # Average multiple constraints that hit the same vertex
-      target = np.zeros((idx_unique.size, 3), np.float64)
-      np.add.at(target, inv, np.asarray(dst_corr, np.float64))
+      displacement = np.zeros((idx_unique.size, 3), np.float64)
+      np.add.at(displacement, inv, dst_corr - src_corr)
       counts = np.bincount(inv, minlength=idx_unique.size).astype(np.float64)
-      target /= counts[:, None]
+      displacement /= counts[:, None]
 
-      # Assemble W and RHS
-      n = V0.shape[0]
+      n = len(V0)
       Wd = np.zeros(n, dtype=np.float64); Wd[idx_unique] = 1.0
       A = (A0 + lam * diags(Wd)).tocsc()
-      lu = splu(A)
-
       B = np.zeros((n, 3), np.float64)
-      B[idx_unique, :] = target
-      B *= lam
+      B[idx_unique] = lam * displacement
 
-      # Solve for X (per coordinate)
-      V1 = np.empty_like(V0)
-      V1[:, 0] = lu.solve(B[:, 0])
-      V1[:, 1] = lu.solve(B[:, 1])
-      V1[:, 2] = lu.solve(B[:, 2])
+      # The biharmonic nullspace on an unanchored connected component is
+      # singular. Do not invent motion or artificial anchors on that component.
+      # Use the operator graph, not all stored faces: degenerate triangles
+      # discarded by _cotangent_laplacian must not bridge otherwise separate
+      # islands and introduce an unanchored nullspace into the active solve.
+      adjacency = L.copy()
+      adjacency.setdiag(0)
+      adjacency.eliminate_zeros()
+      _, labels = connected_components(adjacency, directed=False)
+      active = np.isin(labels, labels[idx_unique])
+      delta = np.zeros_like(V0)
+      lu = splu(A[active][:, active].tocsc())
+      delta[active] = lu.solve(B[active])
+      V1 = V0 + delta
+      if not np.isfinite(V1).all():
+          raise RuntimeError("Biharmonic warp produced non-finite coordinates")
 
-      # Write back
       pts = modelNode.GetPolyData().GetPoints()
-      pts.SetData(vtk_np.numpy_to_vtk(V1.astype(np.float32, copy=False), deep=1))
+      pts.SetData(vtk_np.numpy_to_vtk(V1, deep=1))
       pts.Modified(); modelNode.GetPolyData().Modified()
-
-      return V0, V1, F  # handy if you want barycentric landmark warping
+      return V0, V1, F
 
   def warp_markups_barycentric(self, markupsNode, V0, V1, F):
     """Project each point to the nearest triangle on (V0,F), get barycentric
@@ -1775,8 +1867,9 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
 
   # ---------- Stable TPS/RBF backend ----------
   def _tps_kernel_3d(self, r):
-      # Classic 3D TPS radial kernel U(r) = r
-      return r
+      # U(r)=-r is conditionally positive definite on the affine nullspace.
+      # With +lambda I, positive smoothing damps rather than amplifies modes.
+      return -r
 
   def _fps_indices(self, P, m, seed=0):
       """Farthest point sampling indices on P (N,3)."""
@@ -1802,14 +1895,19 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
       """
       src = np.asarray(src, np.float64)
       dst = np.asarray(dst, np.float64)
-      if src.shape != dst.shape or src.shape[1] != 3:
+      if src.ndim != 2 or src.shape != dst.shape or src.shape[1] != 3:
           raise ValueError("TPS fit expects src/dst with shape (N,3)")
 
+      if not np.isfinite(src).all() or not np.isfinite(dst).all():
+          raise ValueError("TPS controls must be finite")
+      if not np.isfinite(lam) or lam < 0:
+          raise ValueError("TPS lambda must be finite and non-negative")
+      if max_corr is not None and int(max_corr) < 1:
+          raise ValueError("TPS constraint cap must be positive")
       n = src.shape[0]
-      if n < 4:
-          # Fallback: affine fit
-          A = self._fit_affine(src, dst)  # (4×3)
-          return src, np.zeros((n,3), dtype=np.float64), A
+      if n == 0:
+          # No controls means no requested deformation.
+          return src, np.zeros((0, 3)), np.vstack([np.zeros((1, 3)), np.eye(3)])
 
       # Reduce constraints if needed
       if max_corr is not None and n > int(max_corr):
@@ -1817,6 +1915,11 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
           src = src[idx]
           dst = dst[idx]
           n = src.shape[0]
+
+      if n < 4:
+          # _fit_affine uses [x,y,z,1], whereas TPS evaluates [1,x,y,z].
+          A_xyz1 = self._fit_affine(src, dst)
+          return src, np.zeros((n, 3)), A_xyz1[[3, 0, 1, 2]]
 
       # Build K (n×n)
       # pairwise distances
@@ -2053,6 +2156,21 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
     return points
 
   def projectPointsPolydataCoherent(self, targetPolydata, originalPoints, rayLength, k_neighbors=6, lambda_cohere=2.0, snap_to_surface=True, surface_tol=5e-4, outward_eps=1e-3, use_outer_surface=True):
+      """Project without exceeding rayLength in the input coordinate units.
+
+      If the coherent surface candidate exceeds the bound, try the nearest
+      surface point to the original landmark. If that is also unreachable,
+      retain the original point (which may therefore remain off the surface).
+      Empty landmark sets are returned empty; non-empty sets need a surface.
+      """
+      maxmove = float(rayLength)
+      if not np.isfinite(maxmove) or maxmove < 0:
+          raise ValueError("Projection distance must be finite and non-negative")
+      N = originalPoints.GetNumberOfPoints()
+      if N == 0:
+          out = vtk.vtkPolyData(); out.SetPoints(vtk.vtkPoints()); return out
+      if targetPolydata.GetNumberOfPolys() == 0:
+          raise ValueError("Projection requires a non-empty polygonal surface")
       # --- target prep (single outer skin + normals + SDF) ---
       def _outer(pd):
           if not use_outer_surface: return pd
@@ -2067,17 +2185,22 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
       cellLoc=vtk.vtkStaticCellLocator(); cellLoc.SetDataSet(tgt); cellLoc.BuildLocator()
       sdf=vtk.vtkImplicitPolyDataDistance(); sdf.SetInput(tgt)
       B=np.array(tgt.GetBounds(),float).reshape(3,2); diag=float(np.linalg.norm(B[:,1]-B[:,0]))+1e-12
-      tol=float(surface_tol)*diag; eps=float(outward_eps)*diag; maxmove=float(rayLength)*1.0  # rayLength is already in “diag” units in your UI
+      tol=float(surface_tol)*diag; eps=float(outward_eps)*diag
 
       # --- data & masks ---
       N=originalPoints.GetNumberOfPoints()
       P0=np.array([originalPoints.GetPoint(i) for i in range(N)],float)
+      if not np.isfinite(P0).all():
+          raise ValueError("Projection points must be finite")
       d0=np.array([sdf.FunctionValue(P0[i]) for i in range(N)],float)  # signed distance
       fixed_mask=(d0>=0.0)&(np.abs(d0)<=tol)         # already on/near *exterior* surface => freeze
       move_mask=~fixed_mask                           # move the rest (outside but far, or inside)
       if not np.any(move_mask):
-          out=vtk.vtkPolyData(); pts=vtk.vtkPoints()
-          for i in range(N): pts.InsertNextPoint(P0[i]); out.SetPoints(pts); return out
+          out=vtk.vtkPolyData(); pts=vtk.vtkPoints(); pts.SetDataTypeToDouble()
+          for i in range(N):
+              pts.InsertNextPoint(P0[i])
+          out.SetPoints(pts)
+          return out
 
       # --- anchors only for moving points (nearest surface + outward nudge if inside) ---
       A=np.empty((N,3),float); w=np.zeros((N,),float)
@@ -2109,19 +2232,21 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
 
       # --- clamp travel and enforce exterior at the end (moved points only) ---
       dvec=X-P0; dlen=np.linalg.norm(dvec,axis=1)
-      over = (dlen>maxmove+1e-12)&move_mask
+      over = (dlen>maxmove)&move_mask
       if np.any(over): X[over]=P0[over]+dvec[over]*(maxmove/(dlen[over]+1e-12))[:,None]
 
       if snap_to_surface:
           for i in np.where(move_mask)[0]:
               cellLoc.FindClosestPoint(X[i].tolist(),cp,cid,sid,d2)
               q=np.array(cp,float)
-              if sdf.FunctionValue(q)<0.0:
-                  g=np.zeros(3); sdf.FunctionGradient(q,g); ng=np.linalg.norm(g)
-                  if ng>0: q=q+(eps*(g/ng))
-              X[i]=q
+              if np.linalg.norm(q - P0[i]) > maxmove:
+                  # The nearest point to the original is reachable whenever
+                  # any surface point is. The coherent snap may not be.
+                  cellLoc.FindClosestPoint(P0[i].tolist(),cp,cid,sid,d2)
+                  q=np.array(cp,float)
+              X[i] = q if np.linalg.norm(q - P0[i]) <= maxmove else P0[i]
 
-      pts=vtk.vtkPoints()
+      pts=vtk.vtkPoints(); pts.SetDataTypeToDouble()
       for i in range(N): pts.InsertNextPoint(X[i].tolist())
       out=vtk.vtkPolyData(); out.SetPoints(pts); return out
 
@@ -2251,7 +2376,8 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
           if best_loc[1] is None: raise RuntimeError("RANSAC failed")
           return best_loc[1], best_loc[2], best_loc[3]
 
-      iL = 1.0 / (eig_k + 1e-12)
+      # b is standardized: ssm_sample already multiplies by sqrt(eigenvalue).
+      # Its prior is ||b||^2, independent of the model's length units.
       rho = float(parameters.get("reg_strength", 0.10))
       w_reg = min(rho / k_eff, 0.25 / (k_eff * (span**2) + 1e-12))
       LARGE = 1e6; bound_margin = float(parameters.get("bound_margin", 1e-5))
@@ -2261,7 +2387,7 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
       def score_geom(b, iters, coarse, nrestarts):
           b = clip_b(b); key = (tuple(np.round(b,6)), bool(coarse), int(iters), int(nrestarts))
           if key in cache: return cache[key]["neg"]
-          reg = float(b @ (iL * b))
+          reg = float(b @ b)
           rmse_headroom = 0.05
           # upper bound on possible score for pruning
           ub = 1.0 - w_rmse*0.0 - w_reg*reg
@@ -2396,25 +2522,36 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
       return np.zeros(k, float), best["T"]
 
   def _knn_graph_laplacian(self, X, k=6, sigma=None):
-      # X: (N,3); returns L (N×N CSR), and degree-normalized weights W_ij
+      """Return a symmetric kNN Laplacian; empty/singleton graphs have no edges."""
       from scipy.spatial import cKDTree
       from scipy import sparse
       X = np.asarray(X, float)
-      N = X.shape[0]
-      tree = cKDTree(X)
-      d, idx = tree.query(X, k=k+1)          # first neighbor is self
-      idx = idx[:, 1:]; d = d[:, 1:]
+      if X.ndim != 2 or X.shape[1] != 3 or not np.isfinite(X).all():
+          raise ValueError("Graph points must have finite shape (N,3)")
+      N = len(X)
+      if int(k) < 0:
+          raise ValueError("Neighbor count must be non-negative")
+      k_eff = min(int(k), max(0, N - 1))
+      if sigma is not None and (not np.isfinite(sigma) or sigma <= 0):
+          raise ValueError("Graph bandwidth must be finite and positive")
+      if k_eff == 0:
+          empty = sparse.csr_matrix((N, N))
+          return empty, empty.copy(), 1.0 if sigma is None else float(sigma)
+      distances, neighbors = cKDTree(X).query(X, k=k_eff + 1)
+      # Explicitly remove self, including duplicate-coordinate ties where self
+      # need not be the first neighbor returned by cKDTree.
+      idx = np.empty((N, k_eff), dtype=int)
+      d = np.empty((N, k_eff), dtype=float)
+      for i in range(N):
+          keep = neighbors[i] != i
+          idx[i] = neighbors[i][keep][:k_eff]
+          d[i] = distances[i][keep][:k_eff]
       if sigma is None:
           sigma = np.median(d[:, -1]) + 1e-12
       wij = np.exp(-(d**2) / (2.0 * sigma**2))
-      # Build symmetric weight matrix
-      rows = np.repeat(np.arange(N), k)
-      cols = idx.ravel()
-      data = wij.ravel()
-      W = sparse.coo_matrix((data, (rows, cols)), shape=(N, N))
-      # symmetrize
+      rows = np.repeat(np.arange(N), k_eff)
+      W = sparse.coo_matrix((wij.ravel(), (rows, idx.ravel())), shape=(N, N))
       W = (W + W.T) * 0.5
-      # Laplacian
       deg = np.array(W.sum(axis=1)).ravel()
       L = sparse.diags(deg) - W
       return L.tocsr(), W.tocsr(), sigma

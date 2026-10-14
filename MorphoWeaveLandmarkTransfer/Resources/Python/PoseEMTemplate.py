@@ -138,6 +138,7 @@ def _require_native_pose_initializer(initializer: Callable[..., Any]) -> None:
         "refine_source_count",
         "lambda_regularization",
         "parallel",
+        "with_scale",
     }
     missing = sorted(required.difference(parameters))
     if missing:
@@ -311,17 +312,18 @@ def run_pose_em_registration(
         working_target,
         working_modes_flat,
         eigenvalues,
+        with_scale=bool(with_scale),
         **settings.initializer_kwargs(),
     )
     coefficients = np.asarray(initial.coefficients, dtype=np.float64).reshape(-1)
     rotation = np.asarray(initial.rotation, dtype=np.float64)
     initial_shape = ssm_sample(working_mean, working_modes, coefficients)
-    if with_scale:
-        scale = float(initial.scale)
-        translation = np.asarray(initial.translation, dtype=np.float64).reshape(1, 3)
-    else:
-        scale = 1.0
-        translation = fixed_scale_translation(initial_shape, working_target, rotation)
+    scale = float(initial.scale)
+    if not with_scale and not np.isclose(scale, 1.0, rtol=0.0, atol=1e-12):
+        raise RuntimeError("Pose initializer did not honor with_scale=False")
+    # Translation belongs to the native optimum, including fixed-scale fits.
+    # Recentring the full shape on a fragment would invalidate that optimum.
+    translation = np.asarray(initial.translation, dtype=np.float64).reshape(1, 3)
 
     # The initializer has already refined its finalists. Template optimization
     # needs only those coefficients; a second dense atlas pass was redundant
@@ -345,6 +347,7 @@ def run_pose_em_registration(
         "target_centroid": target_centroid.copy(),
         "source_scale": float(source_scale),
         "pose_parallel": bool(settings.parallel),
+        "with_scale": bool(with_scale),
     }
     return PoseEMRegistrationResult(
         points=points,

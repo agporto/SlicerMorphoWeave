@@ -279,6 +279,7 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
             initializer=initializer,
         )
         self.assertTrue(initializer.calls[0]["parallel"])
+        self.assertIs(initializer.calls[0]["with_scale"], True)
         self.assertEqual(initializer.calls[0]["lambda_regularization"], 5.0)
         self.assertEqual(initializer.args[0][2].shape, (mean.size, 1))
         self.assertTrue(result.final_parameters["pose_parallel"])
@@ -366,19 +367,31 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
         )
         self.assertEqual(result.hypotheses_evaluated, 61)
 
-    def test_fixed_scale_handoff_recenters_pose_and_disables_scale_optimization(self):
+    def test_fixed_scale_is_forwarded_and_preserves_optimized_translation(self):
         mean = np.array([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
         modes = np.zeros((2, 3, 1))
         eigenvalues = np.array([1.0])
         rotation = Rotation.from_euler("z", 35.0, degrees=True).as_matrix()
         target = mean @ rotation.T + np.array([3.0, -2.0, 0.5])
+        translation = np.array([[.3, -.7, .2]])
+        initializer = _initializer([0.0], rotation, 1.0, translation)
         result = run_pose_em_registration(
             mean, target, modes, eigenvalues, PoseEMSettings(rotation_count=12),
-            with_scale=False,
-            initializer=_initializer([0.0], rotation, 0.4, [[9.0, 9.0, 9.0]]),
+            with_scale=False, initializer=initializer,
         )
+        self.assertIs(initializer.calls[0]["with_scale"], False)
         self.assertAlmostEqual(result.scale, 1.0)
-        np.testing.assert_allclose(result.points.mean(0), target.mean(0), atol=1e-12)
+        self.assertIs(result.final_parameters["with_scale"], False)
+        np.testing.assert_allclose(result.final_parameters["t_preconditioned"], translation)
+        np.testing.assert_allclose(result.points, mean @ rotation.T + translation + target.mean(0))
+        np.testing.assert_allclose(transform_points(mean, result.similarity_matrix()), result.points)
+
+    def test_fixed_scale_initializer_cannot_hide_a_scale_enabled_result(self):
+        mean = np.array([[-1., 0., 0.], [1., 0., 0.]])
+        with self.assertRaisesRegex(RuntimeError, "did not honor with_scale=False"):
+            run_pose_em_registration(mean, mean, np.zeros((2, 3, 1)), np.ones(1),
+                PoseEMSettings(), with_scale=False,
+                initializer=_initializer([0.], np.eye(3), 1.5, [[0., 0., 0.]]))
 
     def test_partial_target_prescale_is_carried_into_fixed_scale_registration(self):
         mean = np.array([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
@@ -388,7 +401,7 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
         result = run_pose_em_registration(
             mean, target, modes, np.array([1.0]), PoseEMSettings(rotation_count=12),
             with_scale=False, source_scale=source_scale,
-            initializer=_initializer([0.0], np.eye(3), 0.5, [[0.0, 0.0, 0.0]]),
+            initializer=_initializer([0.0], np.eye(3), 1.0, [[0.0, 0.0, 0.0]]),
         )
         self.assertAlmostEqual(source_scale, 0.5)
         self.assertAlmostEqual(result.scale, source_scale)
@@ -396,6 +409,47 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
 
 
 class PoseEMTemplateIntegrationTest(unittest.TestCase):
+    def test_native_fixed_scale_flag_and_translation_match_returned_model(self):
+        try:
+            from rustcpd import pose_initialize
+        except (ImportError, AttributeError):
+            self.skipTest("rustcpd pose-EM API is unavailable")
+        rng = np.random.default_rng(41)
+        mean = rng.normal(size=(40, 3)) * [3, 2, 1]
+        mean -= mean.mean(0)
+        mode = np.zeros_like(mean); mode[:, 0] = mean[:, 0]
+        mode /= np.linalg.norm(mode)
+        modes = mode[:, :, None]
+        eigenvalues = np.array([25.])
+        settings = PoseEMSettings(rotation_count=1, coarse_source_count=40,
+            coarse_target_count=40, coarse_rank=1, coarse_iterations=12,
+            coarse_screen_iterations=12, coarse_survivor_count=1, refine_count=1,
+            refine_target_count=40, refine_iterations=40, lambda_reg=.1,
+            outlier_weight=.01, parallel=False)
+        captured = []
+        def initialize(*args, **kwargs):
+            native = pose_initialize(*args, **kwargs)
+            captured.append((kwargs, native))
+            return _adapt_rustcpd_initialization(native)
+        for source_scale, target in ((1., 1.5 * mean), (2., 2. * mean[:30] + [20, -30, 10])):
+            result = run_pose_em_registration(mean, target, modes, eigenvalues, settings,
+                with_scale=False, source_scale=source_scale, initializer=initialize)
+            kwargs, native = captured[-1]
+            self.assertIs(kwargs["with_scale"], False)
+            self.assertAlmostEqual(native.scale, 1.)
+            self.assertAlmostEqual(result.scale, source_scale)
+            np.testing.assert_allclose(result.final_parameters["t_preconditioned"],
+                                       np.asarray(native.translation).reshape(1, 3))
+            sample = ssm_sample(mean, modes, result.coefficients)
+            expected = source_scale * ((sample - mean.mean(0)) @ native.rotation) + native.translation + target.mean(0)
+            np.testing.assert_allclose(result.points, expected, atol=1e-12)
+            np.testing.assert_allclose(transform_points(sample, result.similarity_matrix()), result.points, atol=1e-12)
+            self.assertEqual(result.score, native.score)
+        # The scale-free fixture requires shape adaptation rather than hiding
+        # a 1.5 native scale behind a postprocessed fixed-scale result.
+        self.assertGreater(abs(captured[0][1].coefficients[0]), 1.)
+
+
     def test_small_offset_target_retains_template_shape_without_redundant_completion(self):
         try:
             from rustcpd import pose_initialize
