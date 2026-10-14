@@ -1,4 +1,4 @@
-> Correctness update based on shape-completion commit e397882d. Start with [RESTORATION.md](RESTORATION.md) for safe installation and incompatible calibration-profile changes, and [VALIDATION_PROTOCOL.md](VALIDATION_PROTOCOL.md) for the validation workflow. This working copy has not been published to GitHub.
+> Correctness update based on shape-completion commit e397882d. Start with [RESTORATION.md](RESTORATION.md) for safe installation and incompatible calibration-profile changes, and [VALIDATION_PROTOCOL.md](VALIDATION_PROTOCOL.md) for the validation workflow. The review branch also contains the cross-module repairs summarized in [CORRECTNESS_STATUS.md](../CORRECTNESS_STATUS.md).
 
 # MorphoWeave Shape Completion
 
@@ -6,12 +6,11 @@
 
 See [TUTORIAL.md](TUTORIAL.md) for a complete first-run walkthrough, high-resolution settings, output interpretation, calibration, and troubleshooting.
 
-## Installing this local restoration
+## Installing the review branch
 
-This is a complete replacement **module directory**, not the entire extension.
 Follow [RESTORATION.md](RESTORATION.md). Preserve your working installation and
-replace only `MorphoWeaveShapeCompletion` in a separate copy of your existing
-`shape-completion` checkout. No package-level installer script is included.
+load a separate checkout of the review branch through Extension Wizard. The branch
+includes changes to all five modules; no package-level installer script is included.
 
 ## Registration pipeline
 
@@ -30,6 +29,18 @@ The module runs in either mode:
 - **landmark assisted**, using homologous target landmarks in pose scoring, pose refinement, and atlas registration.
 
 Landmark mode is strict: when selected, an invalid or absent landmark match stops the run rather than silently reverting to surface-only completion.
+
+## Length units and the final atlas fit
+
+The final atlas stage now uses the same normalized-coordinate convention as pose
+initialization. Its explicitly initialized physical residual variance is divided
+by the working target RMS radius squared exactly once before the native call.
+The original SSM eigenvalue/coefficient convention is preserved; eigenvalues are
+not rescaled a second time. This removes the wrapper-level outlier-density unit
+dependence. It does not fix native absolute coefficient stopping criteria, tiny
+eigenvalue clamps, optional regularizer units, or every calibration variance
+floor. Exact invariance across arbitrary units is not claimed. Existing calibration
+profiles are invalidated by the new algorithm/source signatures.
 
 ## Target coverage
 

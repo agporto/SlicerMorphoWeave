@@ -1,10 +1,11 @@
 # Correctness update of the restored fragment implementation
 
 This separate working copy is based on `shape-completion` commit
-`e397882d54994479ef19279756b8beb82d382856`. It is a reviewable local update,
-not a change published to GitHub. The historical upload and batch provenance
-remain in `RESTORATION_PROVENANCE.json`; its `correctness_update` section records
-intentional differences. The core is no longer byte-for-byte identical to the
+`e397882d54994479ef19279756b8beb82d382856`. It is a reviewable update on the separate
+`fix/shape-completion-correctness-audit` branch. The historical upload and batch provenance
+remain in `RESTORATION_PROVENANCE.json`; its `correctness_update` and `audit_branch_update` sections record
+intentional differences. Earlier delivery descriptions in the provenance file
+are historical, not the current branch publication status. The core is no longer byte-for-byte identical to the
 historical restoration.
 
 ## What changed
@@ -20,6 +21,9 @@ historical restoration.
   points on the complete triangle surface, not nearest vertices. Missing-region
   membership uses the corresponding closest truth-side locations. Exact dense
   correspondence truth is unchanged.
+- The final atlas fit is normalized, with explicit initial variance converted
+  into that frame. Coarse triangle-surface landmark validation and classifier
+  AUC scoring are corrected. Native stopping/floor limitations remain.
 - Regression tests and a native validation scaffold accompany the changes.
   See `VALIDATION_PROTOCOL.md` and the delivered test report for measured results.
 
@@ -43,9 +47,8 @@ different scopes, detailed in the README.
 ## Install without replacing your baseline
 
 1. Close Slicer and preserve your working installation and inputs.
-2. In a separate copy of the pinned `shape-completion` checkout, replace the
-   complete `MorphoWeaveShapeCompletion` directory with the updated directory.
-   Keep backups outside Slicer's scanned extension paths.
+2. Check out `fix/shape-completion-correctness-audit` in a separate repository
+   copy. Keep backups outside Slicer's scanned extension paths.
 3. Use Extension Wizard to load that separate checkout. Expected tabs are
    **Complete Shape / Batch / Optimize / Calibration / Advanced**.
 4. Keep `rustcpd==4.0.0`. Restart Slicer if another backend version was loaded.
@@ -54,7 +57,8 @@ different scopes, detailed in the README.
 6. Check a known successful fragment first, then single/batch equivalence,
    surface-only/landmark modes, calibration with real triangle meshes, and export.
 
-No input datasets or other MorphoWeave modules are modified by this update.
+No input datasets are included or modified. This branch also repairs other
+MorphoWeave modules; see `../CORRECTNESS_STATUS.md` for the complete scope.
 
 ## Running regression tests
 

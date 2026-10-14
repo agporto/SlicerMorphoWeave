@@ -30,6 +30,7 @@ slicerMacroBuildScriptedModule(
 if(BUILD_TESTING)
   slicer_add_python_unittest(SCRIPT ${MODULE_NAME}.py)
   slicer_add_python_unittest(SCRIPT Testing/Python/ShapeCompletionCoreTest.py)
+  slicer_add_python_unittest(SCRIPT Testing/Python/ShapeCompletionAuditRegressionTest.py)
   slicer_add_python_unittest(SCRIPT Testing/Python/ShapeCompletionGeometryTest.py)
   slicer_add_python_unittest(SCRIPT Testing/Python/ShapeCompletionModuleSourceTest.py)
   slicer_add_python_unittest(SCRIPT Testing/Python/FragmentRestorationTest.py)

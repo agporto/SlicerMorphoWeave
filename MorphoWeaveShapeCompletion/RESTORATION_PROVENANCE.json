@@ -151,10 +151,20 @@
     },
     "intentional_changed_callables": {
       "MorphoWeaveShapeCompletionWidget._build_advanced_ui": "16c0df436fab758d19662094cdfa47124e2a0d9f58ed6574745fc1c071009eae",
-      "MorphoWeaveShapeCompletionWidget._run_completion_impl": "67dd20436239e0a424d83b109984533f6a3fd73f462d317057699dc5126c4908",
-      "MorphoWeaveShapeCompletionWidget._run_calibration_impl": "43b0cb975aad583d545bae0196332f1af7bbdf4c1db400d9c8d61639382cb0c5"
+      "MorphoWeaveShapeCompletionWidget._run_completion_impl": "ee38a1c6f9f63ceddd6202154e4505280b474faa481cb58faa332c832efb8b5f",
+      "MorphoWeaveShapeCompletionWidget._run_calibration_impl": "b7c51570d159ab229cac6755a1e2d7040a143d86a7fdc8f9ed9bc336d2a0565f"
     },
-    "core_sha256": "54158b57286d5d76bfe6b08821ab6d85b96cff0179d1a1306215897e8e0ca455",
-    "note": "Historical restoration fields above remain archival. Source-segment hashes avoid interpreter-version-dependent AST serialization. The correctness update intentionally changes prior semantics, profile provenance, and surface-distance calibration."
+    "core_sha256": "3fa004796f16f08f5d93aacec2fa4ac837efaac8f6487c9d8fddba1c6644fe55",
+    "note": "Historical restoration fields above remain archival. Source-segment hashes avoid interpreter-version-dependent AST serialization. The correctness update intentionally changes prior semantics, profile provenance, and surface-distance calibration.",
+    "audit_branch_update": {
+      "algorithm_version": "3-normalized-atlas-triangle-validation",
+      "changes": [
+        "Normalize final atlas and express explicit sigma2 in its normalized working frame.",
+        "Use triangle distances for mesh/observation frame validation.",
+        "Report AUC of fitted classifier probabilities."
+      ],
+      "native_dependency_fixes_included": false,
+      "live_slicer_tested": false
+    }
   }
 }

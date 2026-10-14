@@ -1177,9 +1177,8 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
         ssm_template_compatibility = indexed_correspondence_compatibility(
             mean, dense_points
         )
-        template_surface_points = self.logic.model_points_world(template_model)
-        template_compatibility = coordinate_compatibility(
-            template_surface_points,
+        template_compatibility = self.logic.model_coordinate_compatibility(
+            template_model,
             dense_points,
             "template dense correspondences",
         )
@@ -1190,8 +1189,8 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
             landmarks = self._landmark_match_for_nodes(
                 sparse_node, self.target_landmark_selector.currentNode(), dense_node
             )
-            coordinate_compatibility(
-                target_points,
+            self.logic.model_coordinate_compatibility(
+                target_node,
                 landmarks.target_points,
                 "target landmarks",
                 max_median_fraction=0.15,
@@ -1419,8 +1418,8 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
                         raise ValueError(
                             f"{Path(dense_truth_path).name} has {len(dense_truth)} points; expected {len(mean)}"
                         )
-                    compatibility = coordinate_compatibility(
-                        complete_surface,
+                    compatibility = self.logic.model_coordinate_compatibility(
+                        mesh_node,
                         dense_truth,
                         f"dense truth for {Path(mesh_path).name}",
                     )
@@ -1444,8 +1443,8 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
                     target_labels, target_sparse_points = self.logic.markups_labels_points_world(
                         landmark_node
                     )
-                    coordinate_compatibility(
-                        complete_surface,
+                    self.logic.model_coordinate_compatibility(
+                        mesh_node,
                         target_sparse_points,
                         f"target landmarks for {Path(mesh_path).name}",
                         max_median_fraction=0.15,
@@ -1764,6 +1763,19 @@ class MorphoWeaveShapeCompletionLogic(ScriptedLoadableModuleLogic):
             raise ValueError("model contains no points")
         return vtk_np.vtk_to_numpy(polydata.GetPoints().GetData()).astype(
             np.float64, copy=True
+        )
+
+    def model_coordinate_compatibility(self, model_node, candidate_points, label, **kwargs):
+        """Use actual world-space surface distance, not distance to mesh vertices."""
+        surface = self.model_polydata_world(model_node)
+        if surface.GetPoints() is None or surface.GetNumberOfPoints() == 0:
+            raise ValueError("model contains no points")
+        vertices = vtk_np.vtk_to_numpy(surface.GetPoints().GetData()).astype(np.float64, copy=False)
+        distances = None
+        if surface.GetNumberOfPolys() > 0 or surface.GetNumberOfStrips() > 0:
+            _, distances = closest_surface_points(surface, candidate_points)
+        return coordinate_compatibility(
+            vertices, candidate_points, label, surface_distances=distances, **kwargs
         )
 
     def markups_labels_points_world(self, node):

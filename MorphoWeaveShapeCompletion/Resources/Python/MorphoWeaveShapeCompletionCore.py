@@ -14,7 +14,7 @@ import numpy as np
 DEFAULT_COVERAGE = 1.0
 LANDMARK_RECOMMENDED_BELOW = 0.75
 PROFILE_VERSION = 2
-CALIBRATION_ALGORITHM_VERSION = "2-rustcpd4-prior-precision-surface-distance"
+CALIBRATION_ALGORITHM_VERSION = "3-normalized-atlas-triangle-validation"
 _CALIBRATION_SOURCE_FILES = (
     "MorphoWeaveShapeCompletionCore.py",
     "MorphoWeaveShapeCompletionBase.py",
@@ -810,10 +810,22 @@ def coordinate_compatibility(
     *,
     max_median_fraction: float = 0.10,
     max_p95_fraction: float = 0.25,
+    surface_distances: Optional[np.ndarray] = None,
 ) -> dict[str, float]:
+    """Validate a shared frame using supplied triangle distances, or a point-cloud fallback.
+
+    Mesh callers should supply closest-triangle distances. Nearest vertices are
+    only the explicit fallback for references without surface topology.
+    """
     reference = _points(reference_surface_points, "reference surface points")
     candidate = _points(candidate_points, label)
-    _, distances = nearest_indices(reference, candidate)
+    if surface_distances is None:
+        _, distances = nearest_indices(reference, candidate)
+    else:
+        distances = np.asarray(surface_distances, dtype=np.float64)
+        if (distances.shape != (len(candidate),) or not np.all(np.isfinite(distances))
+                or np.any(distances < 0)):
+            raise ValueError("surface_distances must be finite, nonnegative and match candidate points")
     diagonal = max(bbox_diagonal(reference), _TINY)
     median = float(np.median(distances))
     p95 = float(np.quantile(distances, 0.95))
@@ -1044,10 +1056,19 @@ def run_completion(
         if np.isfinite(mean_square) and mean_square > 0.0:
             atlas_sigma2 = float(settings.atlas_sigma2_from_pose_factor) * mean_square
 
+    # rustcpd's explicit sigma2 is in its working frame. Preserve the
+    # original coefficient/eigenvalue convention; native normalization
+    # transforms mean, modes, landmarks and returned geometry internally.
+    atlas_target_radius = rms_radius(working_target)
+    if not np.isfinite(atlas_target_radius) or atlas_target_radius <= 0.0:
+        raise ValueError("cannot normalize a zero-radius target fragment")
+    atlas_working_sigma2 = (
+        None if atlas_sigma2 is None else atlas_sigma2 / atlas_target_radius**2
+    )
     atlas_kwargs: dict[str, Any] = {
-        "sigma2": atlas_sigma2,
+        "sigma2": atlas_working_sigma2,
         "lambda_regularization": float(settings.atlas_lambda),
-        "normalize": False,
+        "normalize": True,
         "optimize_similarity": True,
         "with_scale": bool(with_scale),
         "initial_coefficients": np.asarray(pose.coefficients, dtype=np.float64),
@@ -1757,7 +1778,7 @@ def finalize_calibration_entry(
         probability = classifier.probability(sigma)
         result["fit_success_calibrator"] = classifier.to_dict()
         result["fit_success_apparent_metrics"] = {
-            "auc": auc_rank(-np.log(np.maximum(sigma, _TINY)), success),
+            "auc": auc_rank(probability, success),
             "brier": float(np.mean((probability - success.astype(float)) ** 2)),
             "ece_10bin": expected_calibration_error(probability, success, 10),
         }
