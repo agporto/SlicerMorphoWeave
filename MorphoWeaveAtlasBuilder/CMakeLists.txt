@@ -25,4 +25,5 @@ if(BUILD_TESTING)
   # Note that the test will also be available at runtime.
   slicer_add_python_unittest(SCRIPT ${MODULE_NAME}.py)
   slicer_add_python_unittest(SCRIPT Testing/Python/AtlasBuilderWorkflowTest.py)
+  slicer_add_python_unittest(SCRIPT Testing/Python/AtlasBuilderCorrectnessTest.py)
 endif()

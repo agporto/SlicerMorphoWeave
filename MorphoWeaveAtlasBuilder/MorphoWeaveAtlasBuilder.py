@@ -380,18 +380,22 @@ class MorphoWeaveAtlasBuilderWidget(ScriptedLoadableModuleWidget):
     saveToLibrary = self.saveToLibraryCheck.isChecked()
     if saveToLibrary:
       self._refreshLibraryPath()
+      if not logic.isSafeLibraryName(self._libraryName()):
+        self._status("Run cancelled; choose a safe, nonempty Model Library entry name.")
+        return
       libraryTarget = self._libraryTargetPath()
       if os.path.exists(libraryTarget):
         name = self._libraryName()
         if not slicer.util.confirmOkCancelDisplay(
           f"A Model Library entry named '{name}' already exists.\n\n"
-          "Continuing will overwrite files with matching names. Continue?"
+          "Continuing will replace the entire entry, including any extra files in it. Continue?"
         ):
           self._status("Run cancelled; the existing Model Library entry was not changed.")
           return
 
     keepAlignedOutputs = self.keepAlignedOutputs.isChecked()
     alignedWorkspace = None
+    atlasModel = atlasLMs = None
     try:
       if not keepAlignedOutputs:
         alignedWorkspace = tempfile.TemporaryDirectory(prefix="MorphoWeave-aligned-")
@@ -422,7 +426,7 @@ class MorphoWeaveAtlasBuilderWidget(ScriptedLoadableModuleWidget):
       # 2) Align all to atlas
       try:
         self._status("Aligning all specimens to the atlas…")
-        logic.runAlign(
+        aligned_keys = logic.runAlign(
           atlasModel, atlasLMs,
           F['originalModels'], F['originalLMs'],
           F['alignedModels'],  F['alignedLMs'],
@@ -430,13 +434,14 @@ class MorphoWeaveAtlasBuilderWidget(ScriptedLoadableModuleWidget):
           allowCoordMismatch=self.overrideCoordCheck.isChecked(),
           progress=lambda i,n,s: self._status(f"[{i}/{n}] aligned {s}")
         )
-      except ValueError as e:
-        self._status(str(e)); return
+      except Exception as e:
+        self._status(f"Alignment failed: {e}"); return
 
-      # 3) Save atlas + export dense
-      logic.saveAtlasOnly(atlasModel, atlasLMs, F['atlas'])
+      # 3) Save atlas + export dense. A failed writer must never reach ingestion.
       dense_ok = True
+      dense_error = None
       try:
+        logic.saveAtlasOnly(atlasModel, atlasLMs, F['atlas'])
         self._status(f"Exporting dense correspondences using {method.upper()} projection…")
         logic.exportDenseLMs(
           atlasModel, atlasLMs,
@@ -445,12 +450,13 @@ class MorphoWeaveAtlasBuilderWidget(ScriptedLoadableModuleWidget):
           int(self.targetPointCount.value),
           warp_method=method,
           allow_fallback=allowFallback,
+          expected_specimens=aligned_keys,
           progress=lambda msg: self._status(msg)
         )
       except Exception as e:
         dense_ok = False
-        self._status(f"Dense export failed: {e}")
-      slicer.mrmlScene.RemoveNode(atlasModel); slicer.mrmlScene.RemoveNode(atlasLMs)
+        dense_error = str(e)
+        self._status(f"Atlas/dense export failed: {e}")
       library_ok = None
       if dense_ok and saveToLibrary:
         library_ok = self._saveSsmToLibrary(F)
@@ -469,10 +475,12 @@ class MorphoWeaveAtlasBuilderWidget(ScriptedLoadableModuleWidget):
         if keepAlignedOutputs:
           retainedFolders.extend(["alignedModels/", "alignedLMs/"])
         self._status(
-          f"Completed with warnings. Output: {F['output']} ({', '.join(retainedFolders)}). "
-          "Dense export did not finish."
+          f"Run failed. Partial output: {F['output']} ({', '.join(retainedFolders)}). "
+          f"Atlas/dense export failed: {dense_error}. No Model Library entry was saved."
         )
     finally:
+      if atlasModel is not None: slicer.mrmlScene.RemoveNode(atlasModel)
+      if atlasLMs is not None: slicer.mrmlScene.RemoveNode(atlasLMs)
       if alignedWorkspace is not None:
         alignedWorkspace.cleanup()
 
@@ -480,6 +488,8 @@ class MorphoWeaveAtlasBuilderWidget(ScriptedLoadableModuleWidget):
     try:
       from MorphoWeaveModelLibrary import MorphoWeaveModelLibraryLogic
 
+      if not self.logic.isSafeLibraryName(self._libraryName()):
+        raise ValueError("Choose a safe, nonempty Model Library entry name.")
       os.makedirs(self.libraryRootPath, exist_ok=True)
       target = self._libraryTargetPath()
 
@@ -488,6 +498,7 @@ class MorphoWeaveAtlasBuilderWidget(ScriptedLoadableModuleWidget):
 
       success, message = MorphoWeaveModelLibraryLogic().ingestSSMDatabase(
         dbPath=target,
+        libraryRootPath=self.libraryRootPath,
         templateModelPath=os.path.join(F["atlas"], "atlas_model.ply"),
         templateLandmarksPath=os.path.join(F["atlas"], "atlas_dense_correspondences.mrk.json"),
         sparseLandmarksPath=os.path.join(F["atlas"], "atlas_sparse_landmarks.mrk.json"),
@@ -502,26 +513,25 @@ class MorphoWeaveAtlasBuilderWidget(ScriptedLoadableModuleWidget):
 
   def _generateAtlas(self, F, useSimilarity, warp_method, allowFallback):
     logic = self.logic
-    closest_key = logic.getClosestToMeanPath(F['originalLMs'])
+    closest_key = logic.getClosestToMeanPath(F['originalLMs'], useSimilarity=useSimilarity)
     model_index = logic._list_keys(F['originalModels'], ('.ply', '.stl', '.vtp', '.vtk', '.obj'))
     lm_index = logic._list_keys(F['originalLMs'], ('.mrk.json', '.fcsv', '.json'))
     lm_path = lm_index.get(str(closest_key).lower())
     if not lm_path: raise ValueError(f"Could not resolve LM file for key '{closest_key}'")
-    baseLM = slicer.util.loadMarkups(lm_path)
-    model_path = model_index.get(str(closest_key).lower())
-    baseModel = slicer.util.loadModel(model_path) if model_path else None
-    if not baseModel: raise ValueError(f"Could not resolve model for key '{closest_key}'")
-    self._status(f"Closest sample to mean: {closest_key}")
-
-    self._status("Pre-aligning all specimens to base (reduces warp bending)…")
-    logic.runAlign(baseModel, baseLM, F['originalModels'], F['originalLMs'], F['alignedModels'], F['alignedLMs'], useSimilarity, allowCoordMismatch=self.overrideCoordCheck.isChecked())
-
-
-    self._status(f"Building mean atlas in mean-shape space (template via {warp_method.upper()})…")
-    atlasModel, atlasLMs = logic.runMean(F['alignedLMs'], F['alignedModels'], warp_method=warp_method, allow_fallback=allowFallback)
-
-    slicer.mrmlScene.RemoveNode(baseModel); slicer.mrmlScene.RemoveNode(baseLM)
-    return atlasModel, atlasLMs
+    baseLM = baseModel = None
+    try:
+      baseLM = slicer.util.loadMarkups(lm_path)
+      model_path = model_index.get(str(closest_key).lower())
+      baseModel = slicer.util.loadModel(model_path) if model_path else None
+      if not baseModel: raise ValueError(f"Could not resolve model for key '{closest_key}'")
+      self._status(f"Closest sample to mean: {closest_key}")
+      self._status("Pre-aligning all specimens to base (reduces warp bending)…")
+      logic.runAlign(baseModel, baseLM, F['originalModels'], F['originalLMs'], F['alignedModels'], F['alignedLMs'], useSimilarity, allowCoordMismatch=self.overrideCoordCheck.isChecked())
+      self._status(f"Building mean atlas in mean-shape space (template via {warp_method.upper()})…")
+      return logic.runMean(F['alignedLMs'], F['alignedModels'], warp_method=warp_method, allow_fallback=allowFallback, useSimilarity=useSimilarity)
+    finally:
+      if baseModel is not None: slicer.mrmlScene.RemoveNode(baseModel)
+      if baseLM is not None: slicer.mrmlScene.RemoveNode(baseLM)
 
 # =========================
 # Logic
@@ -721,9 +731,9 @@ class MorphoWeaveAtlasBuilderLogic(ScriptedLoadableModuleLogic):
       if v < best_val: best_val, best = v, i
     return best
 
-  def getClosestToMeanPath(self, landmarkDirectory):
+  def getClosestToMeanPath(self, landmarkDirectory, useSimilarity=True):
     names, L = self.importLandmarks(landmarkDirectory)
-    mean, AL = self.procrustesImposition(L, False)
+    mean, AL = self.procrustesImposition(L, rigidOnly=not useSimilarity)
     idx = self.getClosestToMeanIndex(mean, AL)
     return names[idx]
 
@@ -768,42 +778,93 @@ class MorphoWeaveAtlasBuilderLogic(ScriptedLoadableModuleLogic):
     tree=cKDTree(V); _,idx=tree.query(lm_xyz, k=1); return idx.astype(np.int64,copy=False)
 
   def biharmonicWarpPolyData(self, pd, srcLM_pts, tgtLM_pts, reg=1e-8, allow_fallback=True):
+    """Warp displacements without changing the input vertex IDs or topology.
+
+    Controls are approximated at their nearest vertices; controls sharing a
+    vertex contribute their average displacement, not average absolute position.
+    This remains an experimental deformation, not exact off-surface interpolation.
+    """
     src = vtk_np.vtk_to_numpy(srcLM_pts.GetData()) if isinstance(srcLM_pts, vtk.vtkPoints) else np.asarray(srcLM_pts, float)
     tgt = vtk_np.vtk_to_numpy(tgtLM_pts.GetData()) if isinstance(tgtLM_pts, vtk.vtkPoints) else np.asarray(tgtLM_pts, float)
-    base = self.cleanPolyData(pd, tri=True, merge_tol=0.0, normals=False)
-    V, F = self._pd_to_VF(base)
-    if not (np.all(np.isfinite(src)) and np.all(np.isfinite(tgt)) and np.all(np.isfinite(V))):
-      return self._warp_polydata_tps(pd, srcLM_pts, tgtLM_pts) if allow_fallback else base
+    if src.ndim != 2 or src.shape[1] != 3 or src.shape != tgt.shape or len(src) == 0:
+      raise ValueError("Biharmonic controls must be nonempty matching (N, 3) arrays.")
+    if not (np.isfinite(src).all() and np.isfinite(tgt).all()):
+      raise ValueError("Biharmonic controls contain non-finite coordinates.")
+    if pd is None or pd.GetPoints() is None or pd.GetNumberOfPoints() == 0:
+      raise ValueError("Biharmonic input mesh is empty.")
+    if not np.isfinite(reg) or reg <= 0:
+      raise ValueError("Biharmonic regularization must be positive and finite.")
+
+    # Triangulation is only for the operator. Cleaning here would reorder/remove
+    # vertices and corrupt the keep_idx correspondence selected on the atlas.
+    V, F = self._pd_to_VF(pd)
+    if not np.isfinite(V).all():
+      raise ValueError("Biharmonic mesh contains non-finite coordinates.")
+    if len(F) == 0:
+      raise ValueError("Biharmonic input mesh has no surface triangles.")
+
+    def output(vertices):
+      if not np.isfinite(vertices).all():
+        raise RuntimeError("Biharmonic warp produced non-finite vertices.")
+      out = vtk.vtkPolyData(); out.DeepCopy(pd)
+      pts = vtk.vtkPoints(); pts.SetData(vtk_np.numpy_to_vtk(np.asarray(vertices, dtype=np.float64), deep=True))
+      out.SetPoints(pts)
+      return out
+
+    delta = tgt - src
+    # Exact global translations (including identity) need no sparse solve and
+    # remain exact on disconnected components and with off-vertex controls.
+    if np.all(delta == delta[0]):
+      return output(V + delta[0])
+
+    # A pure rigid change is not bending. Reproduce it directly when the
+    # controls determine a rigid transform, rather than regularizing its motion.
+    if len(src) >= 3 and np.linalg.matrix_rank(src - src.mean(axis=0)) >= 2:
+      src_pts = vtk.vtkPoints(); src_pts.SetData(vtk_np.numpy_to_vtk(np.asarray(src, dtype=np.float64), deep=True))
+      tgt_pts = vtk.vtkPoints(); tgt_pts.SetData(vtk_np.numpy_to_vtk(np.asarray(tgt, dtype=np.float64), deep=True))
+      rigid = vtk.vtkLandmarkTransform(); rigid.SetModeToRigidBody()
+      rigid.SetSourceLandmarks(src_pts); rigid.SetTargetLandmarks(tgt_pts); rigid.Update()
+      matrix = rigid.GetMatrix()
+      R = np.array([[matrix.GetElement(i, j) for j in range(3)] for i in range(3)])
+      shift = np.array([matrix.GetElement(i, 3) for i in range(3)])
+      precision = 128 * np.finfo(float).eps * max(1.0, float(np.max(np.abs(src))), float(np.max(np.abs(tgt))))
+      if np.allclose(src @ R.T + shift, tgt, rtol=0, atol=precision):
+        return output(V @ R.T + shift)
+
+    c_idx = self._nearest_vertex_ids(V, src)
+    uniq, inv = np.unique(c_idx, return_inverse=True)
+    Uc = np.zeros((uniq.size, 3), dtype=np.float64)
+    np.add.at(Uc, inv, delta)
+    Uc /= np.bincount(inv)[:, None]
+    f_idx = np.setdiff1d(np.arange(V.shape[0], dtype=np.int64), uniq)
+    U = np.zeros_like(V); U[uniq] = Uc
+    if f_idx.size == 0:
+      return output(V + U)
+
+    last_error = None
     for reg_try in (reg, reg*10, reg*100):
       try:
         L = self._cot_laplacian(V, F)
         A = (L.T @ L) + reg_try * speye(L.shape[0], format="csr")
-        c_idx = self._nearest_vertex_ids(V, src)
-        uniq, inv = np.unique(c_idx, return_inverse=True)
-        tgt_at = np.zeros((uniq.size,3)); cnt = np.zeros(uniq.size)
-        for i,u in enumerate(inv): tgt_at[u] += tgt[i]; cnt[u] += 1
-        tgt_at /= np.maximum(cnt[:,None], 1.0)
-        src_at = V[uniq]
-        Uc = tgt_at - src_at
-        all_idx = np.arange(V.shape[0], dtype=np.int64)
-        f_idx = np.setdiff1d(all_idx, uniq, assume_unique=False)
-        if f_idx.size == 0: return self._warp_polydata_tps(pd, srcLM_pts, tgtLM_pts) if allow_fallback else base
-        Aff = A[f_idx][:, f_idx]; Afc = A[f_idx][:, uniq]; rhs = -Afc @ Uc
-        pref = splu(Aff.tocsc()); Uf = pref.solve(rhs)
-        U = np.zeros_like(V); U[uniq] = Uc; U[f_idx] = Uf
-        Vn = V + U
-        if np.all(np.isfinite(Vn)):
-          out = vtk.vtkPolyData(); out.DeepCopy(base)
-          pts = vtk.vtkPoints(); pts.SetData(vtk_np.numpy_to_vtk(Vn.astype(np.float32), deep=True))
-          out.SetPoints(pts); out.GetPoints().Modified()
-          return out
-      except Exception:
-        continue
-    return self._warp_polydata_tps(pd, srcLM_pts, tgtLM_pts) if allow_fallback else base
+        rhs = -A[f_idx][:, uniq] @ Uc
+        U[f_idx] = splu(A[f_idx][:, f_idx].tocsc()).solve(rhs)
+        if not np.isfinite(U).all():
+          raise RuntimeError("Biharmonic solve produced non-finite displacements.")
+        return output(V + U)
+      except Exception as error:
+        last_error = error
+    if allow_fallback:
+      src_pts = vtk.vtkPoints(); src_pts.SetData(vtk_np.numpy_to_vtk(np.asarray(src, dtype=np.float64), deep=True))
+      tgt_pts = vtk.vtkPoints(); tgt_pts.SetData(vtk_np.numpy_to_vtk(np.asarray(tgt, dtype=np.float64), deep=True))
+      out = self._warp_polydata_tps(pd, src_pts, tgt_pts)
+      if out.GetNumberOfPoints() != len(V) or not np.isfinite(vtk_np.vtk_to_numpy(out.GetPoints().GetData())).all():
+        raise RuntimeError("Biharmonic solve and TPS fallback failed.") from last_error
+      return out
+    raise RuntimeError(f"Biharmonic solve failed (TPS fallback disabled): {last_error}") from last_error
 
   # -------- Dense correspondence in mean space --------
-  def denseCorrespondence(self, LMs, meshes, warp_method="tps", allow_fallback=True, progress=None):
-    mean, AL = self.procrustesImposition(LMs, False)
+  def denseCorrespondence(self, LMs, meshes, warp_method="tps", allow_fallback=True, progress=None, useSimilarity=True):
+    mean, AL = self.procrustesImposition(LMs, rigidOnly=not useSimilarity)
     N = AL.GetNumberOfBlocks()
     if N == 0:
       out = vtk.vtkMultiBlockDataSet(); return out, 0, mean
@@ -894,9 +955,9 @@ class MorphoWeaveAtlasBuilderLogic(ScriptedLoadableModuleLogic):
     poly = vtk.vtkPolyData(); poly.SetPoints(p)
     return poly
 
-  def runMean(self, lmDir, meshDir, warp_method="tps", allow_fallback=True):
+  def runMean(self, lmDir, meshDir, warp_method="tps", allow_fallback=True, useSimilarity=True):
     names, Ms, _, LMs = self.importPaired(meshDir, lmDir, normals=False)
-    G, baseIdx, meanPts = self.denseCorrespondence(LMs, Ms, warp_method=warp_method, allow_fallback=allow_fallback)
+    G, baseIdx, meanPts = self.denseCorrespondence(LMs, Ms, warp_method=warp_method, allow_fallback=allow_fallback, useSimilarity=useSimilarity)
     avg = self.computeAverageModelFromGroup(G, baseIdx)
     M = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLModelNode','Atlas Model'); M.CreateDefaultDisplayNodes(); M.SetAndObservePolyData(avg)
     mean_np = vtk_np.vtk_to_numpy(meanPts.GetData())
@@ -916,6 +977,7 @@ class MorphoWeaveAtlasBuilderLogic(ScriptedLoadableModuleLogic):
               slmDir=False, outSLMDir=False, progress=None, allowCoordMismatch=False):
     semis = bool(slmDir and outSLMDir)
     scratch = None; model_scratch = None
+    lmNode = modelNode = slm = None
     md = self._list_keys(meshDir, ('.ply', '.stl', '.vtp', '.vtk', '.obj'))
     ld = self._list_keys(lmDir,  ('.mrk.json', '.fcsv', '.json'))
     sd = self._list_keys(slmDir, ('.mrk.json', '.fcsv', '.json')) if semis else {}
@@ -947,23 +1009,23 @@ class MorphoWeaveAtlasBuilderLogic(ScriptedLoadableModuleLogic):
         modelNode = slicer.util.loadModel(md[sid])
 
         if lmNode.GetNumberOfControlPoints() != baseLMNode.GetNumberOfControlPoints():
-          slicer.mrmlScene.RemoveNode(lmNode)
+          slicer.mrmlScene.RemoveNode(lmNode); lmNode = None
           raise ValueError(f"Landmark mismatch for {sid}")
 
         mesh_pd = vtk.vtkPolyData(); mesh_pd.DeepCopy(modelNode.GetPolyData())
-        slicer.mrmlScene.RemoveNode(modelNode)
+        slicer.mrmlScene.RemoveNode(modelNode); modelNode = None
 
         self.maybeWarnDense(mesh_pd, label=sid)
 
         if mesh_pd.GetNumberOfPoints() == 0 or lmNode.GetNumberOfControlPoints() == 0:
-          slicer.mrmlScene.RemoveNode(lmNode)
+          slicer.mrmlScene.RemoveNode(lmNode); lmNode = None
           raise ValueError(f"[{sid}] Empty mesh or landmark set.")
 
         lm_arr = slicer.util.arrayFromMarkupsControlPoints(lmNode).astype(np.float64, copy=False)
         r0, rflip = self._coord_check_ratio(mesh_pd, lm_arr, threshold=threshold)
         if not allowCoordMismatch and r0 > threshold:
           hint = " Likely LPS landmarks (X,Y need sign flip)." if (rflip < 0.5*r0 and rflip < threshold) else ""
-          slicer.mrmlScene.RemoveNode(lmNode)
+          slicer.mrmlScene.RemoveNode(lmNode); lmNode = None
           raise ValueError(f"[{sid}] Landmark↔mesh coordinate mismatch: median surface distance ≈ {r0*100:.1f}% of bbox diag.{hint} Set 'Override landmark↔mesh coordinate check' to proceed.")
 
         src_pts = self._points_from_markups(lm_arr)
@@ -976,7 +1038,7 @@ class MorphoWeaveAtlasBuilderLogic(ScriptedLoadableModuleLogic):
         ext = os.path.splitext(md[sid])[1] or ".ply"
         with slicer.util.NodeModify(model_scratch):
           model_scratch.SetAndObservePolyData(aligned_mesh_pd)
-        slicer.util.saveNode(model_scratch, os.path.join(outMeshDir, f"{sid}{ext}"))
+        self._save_node_checked(model_scratch, os.path.join(outMeshDir, f"{sid}{ext}"))
 
         # Transform and save landmarks (keep base name)
         lm_h = np.hstack((lm_arr, np.ones((lm_arr.shape[0], 1), dtype=np.float64)))
@@ -985,8 +1047,8 @@ class MorphoWeaveAtlasBuilderLogic(ScriptedLoadableModuleLogic):
         aligned = (Mn @ lm_h.T).T[:, :3]
         with slicer.util.NodeModify(scratch):
           slicer.util.updateMarkupsControlPointsFromArray(scratch, aligned.astype(np.float32, copy=False))
-        slicer.util.saveNode(scratch, os.path.join(outLMDir, f"{sid}.mrk.json"))
-        slicer.mrmlScene.RemoveNode(lmNode)
+        self._save_node_checked(scratch, os.path.join(outLMDir, f"{sid}.mrk.json"))
+        slicer.mrmlScene.RemoveNode(lmNode); lmNode = None
 
         if semis:
           slm_path = sd.get(sid)
@@ -997,8 +1059,8 @@ class MorphoWeaveAtlasBuilderLogic(ScriptedLoadableModuleLogic):
             slm_al = (Mn @ slm_h.T).T[:, :3]
             with slicer.util.NodeModify(scratch):
               slicer.util.updateMarkupsControlPointsFromArray(scratch, slm_al.astype(np.float32, copy=False))
-            slicer.util.saveNode(scratch, os.path.join(outSLMDir, f"{sid}.mrk.json"))
-            slicer.mrmlScene.RemoveNode(slm)
+            self._save_node_checked(scratch, os.path.join(outSLMDir, f"{sid}.mrk.json"))
+            slicer.mrmlScene.RemoveNode(slm); slm = None
 
         done += 1
         if progress: progress(done, total, sid)
@@ -1006,8 +1068,11 @@ class MorphoWeaveAtlasBuilderLogic(ScriptedLoadableModuleLogic):
         if done == total or (now - last_ui_pump >= 0.10):
           qt.QApplication.processEvents()
           last_ui_pump = now
+      return keys
 
     finally:
+      for node in (lmNode, modelNode, slm):
+        if node is not None: slicer.mrmlScene.RemoveNode(node)
       if scratch: slicer.mrmlScene.RemoveNode(scratch)
       if model_scratch: slicer.mrmlScene.RemoveNode(model_scratch)
       try: slicer.app.setRenderPaused(False)
@@ -1025,12 +1090,20 @@ class MorphoWeaveAtlasBuilderLogic(ScriptedLoadableModuleLogic):
   def sample_indices_voxel_target(self, pd, target_count=2000, tolerance=0.02):
     if pd is None or pd.GetPoints() is None:
       return np.empty((0,), dtype=np.int64)
-    points = vtk_np.vtk_to_numpy(pd.GetPoints().GetData()).astype(np.float64, copy=False)
-    return sample_indices_voxel_target_points(
-      points,
+    points, faces = self._pd_to_VF(pd)
+    if not np.isfinite(points).all():
+      raise ValueError("Atlas mesh contains non-finite coordinates.")
+    # Unused points are not surface loci and would be moved by projection even
+    # for identical specimens. Keep the original IDs of surface vertices only.
+    surface_ids = np.unique(faces.ravel())
+    if surface_ids.size == 0:
+      return np.empty((0,), dtype=np.int64)
+    local_ids = sample_indices_voxel_target_points(
+      points[surface_ids],
       target_count=target_count,
       tolerance=tolerance,
     )
+    return surface_ids[local_ids]
 
   def previewCountForTarget(self, polyDataOrNode, targetCount):
     pd = polyDataOrNode if isinstance(polyDataOrNode, vtk.vtkPolyData) else polyDataOrNode.GetPolyData()
@@ -1096,7 +1169,7 @@ class MorphoWeaveAtlasBuilderLogic(ScriptedLoadableModuleLogic):
                      alignedModelsDir, alignedLMsDir,
                      denseDir, atlasDir,
                      targetPointCount,
-                     *, warp_method="tps", allow_fallback=True, progress=None):
+                     *, warp_method="tps", allow_fallback=True, progress=None, expected_specimens=None):
     self._harden_if_parented(atlasModelNode)
     self._harden_if_parented(atlasLMNode)
     self.maybeWarnDense(atlasModelNode.GetPolyData(), label="atlas")
@@ -1121,6 +1194,8 @@ class MorphoWeaveAtlasBuilderLogic(ScriptedLoadableModuleLogic):
 
       names, models, _, lms = self.importPaired(alignedModelsDir, alignedLMsDir, normals=False)
       if len(names) == 0: raise ValueError("No paired aligned models/landmarks found to export.")
+      if expected_specimens is not None and sorted(names) != sorted(expected_specimens):
+        raise ValueError("Aligned specimen set does not match the completed alignment; dense export was not saved.")
       mesh_locators = [self._build_surface_locator(models.GetBlock(i)) for i in range(models.GetNumberOfBlocks())]
 
       baseLM_pts = self.fiducialNodeToPolyData(atlasLMNode, load=False).GetPoints()
@@ -1130,6 +1205,12 @@ class MorphoWeaveAtlasBuilderLogic(ScriptedLoadableModuleLogic):
         warp_method=warp_method, allow_fallback=allow_fallback, progress=progress, mesh_locators=mesh_locators
       )
 
+      if len(pts_list) != len(names):
+        raise ValueError("Dense correspondence result is missing specimens.")
+      for name, arr in zip(names, pts_list):
+        if np.asarray(arr).shape != (len(keep_idx), 3) or not np.isfinite(arr).all():
+          raise ValueError(f"Invalid dense correspondence coordinates for {name}.")
+
       scratch = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsFiducialNode', 'scratch_export')
       scratch.SetHideFromEditors(True)
       sd = scratch.GetDisplayNode()
@@ -1138,14 +1219,14 @@ class MorphoWeaveAtlasBuilderLogic(ScriptedLoadableModuleLogic):
       for i, arr in enumerate(pts_list):
         with slicer.util.NodeModify(scratch):
           slicer.util.updateMarkupsControlPointsFromArray(scratch, arr)
-        slicer.util.saveNode(scratch, os.path.join(denseDir, f"{names[i]}.mrk.json"))
+        self._save_node_checked(scratch, os.path.join(denseDir, f"{names[i]}.mrk.json"))
         if progress: progress(f"Saved dense points for {names[i]}")
 
       atlas_all = vtk_np.vtk_to_numpy(atlasModelNode.GetPolyData().GetPoints().GetData())
       atlas_tpl = atlas_all[keep_idx].astype(np.float32, copy=False)
       with slicer.util.NodeModify(scratch):
         slicer.util.updateMarkupsControlPointsFromArray(scratch, atlas_tpl)
-      slicer.util.saveNode(scratch, os.path.join(atlasDir, "atlas_dense_correspondences.mrk.json"))
+      self._save_node_checked(scratch, os.path.join(atlasDir, "atlas_dense_correspondences.mrk.json"))
       if progress: progress("Saved template points to atlas/atlas_dense_correspondences.mrk.json")
     finally:
       if scratch:
@@ -1154,6 +1235,12 @@ class MorphoWeaveAtlasBuilderLogic(ScriptedLoadableModuleLogic):
       except Exception: pass
 
   # -------- Misc helpers --------
+  def _save_node_checked(self, node, path):
+    if not slicer.util.saveNode(node, path):
+      raise IOError(f"Failed to save output: {path}")
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+      raise IOError(f"Writer reported success but output is missing or empty: {path}")
+
   def _harden_if_parented(self, node):
     tn = node.GetParentTransformNode()
     if tn: slicer.vtkSlicerTransformLogic().hardenTransform(node)
@@ -1161,8 +1248,8 @@ class MorphoWeaveAtlasBuilderLogic(ScriptedLoadableModuleLogic):
   def saveAtlasOnly(self, atlasModelNode, atlasLMNode, atlasDir):
     os.makedirs(atlasDir, exist_ok=True)
     self._harden_if_parented(atlasModelNode); self._harden_if_parented(atlasLMNode)
-    slicer.util.saveNode(atlasModelNode, os.path.join(atlasDir, "atlas_model.ply"))
-    slicer.util.saveNode(atlasLMNode,   os.path.join(atlasDir, "atlas_sparse_landmarks.mrk.json"))
+    self._save_node_checked(atlasModelNode, os.path.join(atlasDir, "atlas_model.ply"))
+    self._save_node_checked(atlasLMNode,   os.path.join(atlasDir, "atlas_sparse_landmarks.mrk.json"))
 
 
 class MorphoWeaveAtlasBuilderTest(ScriptedLoadableModuleTest):
