@@ -1,4 +1,4 @@
-import os, json, logging, html, numpy as np
+import os, json, logging, html, tempfile, numpy as np
 import vtk, qt, ctk, slicer, vtk.util.numpy_support as vtk_np
 from slicer.ScriptedLoadableModule import *
 from scipy.spatial import cKDTree
@@ -13,6 +13,7 @@ def setWorkflowStatus(label, state, detail):
     "ready": ("Ready", "#4f9d69"),
     "optional": ("Optional", "#c18b37"),
     "complete": ("Complete", "#4f9d69"),
+    "warning": ("Finished with issues", "#c18b37"),
   }[state]
   safeDetail = html.escape(str(detail)).replace("\n", "<br>")
   label.setTextFormat(qt.Qt.RichText)
@@ -70,6 +71,8 @@ class MorphoWeaveSurfaceSegmentationWidget(ScriptedLoadableModuleWidget):
     self.kGrid = qt.QLineEdit("10,12,15,18"); fa.addRow("k grid:", self.kGrid)
     self.aGrid = qt.QLineEdit("0.5,0.7,0.9"); fa.addRow("α grid:", self.aGrid)
     self.saveVTP=qt.QCheckBox("Write .vtp with SegID & SegID_smooth"); self.saveVTP.setChecked(True); fa.addRow(self.saveVTP)
+    self.savePLY=qt.QCheckBox("Write PLY segment interiors (mixed-label triangles excluded)")
+    self.savePLY.setChecked(False); fa.addRow(self.savePLY)
     self.previewN=qt.QSpinBox(); self.previewN.setRange(0,20); self.previewN.setValue(3); fa.addRow("Preview first N in scene:",self.previewN)
 
     self.statusLbl = qt.QLabel("")
@@ -89,34 +92,40 @@ class MorphoWeaveSurfaceSegmentationWidget(ScriptedLoadableModuleWidget):
     self.aGrid.setEnabled(bool(enabled))
 
   def _validateInputs(self):
-    dMeshes=os.path.abspath(os.path.expanduser(self._t(self.meshDir)))
-    dMrk=os.path.abspath(os.path.expanduser(self._t(self.mrkDir)))
-    dOut=os.path.abspath(os.path.expanduser(self._t(self.outDir)))
+    mesh_text, mrk_text, out_text = (self._t(w) for w in (self.meshDir, self.mrkDir, self.outDir))
+    if not mesh_text or not mrk_text:
+      self.runBtn.enabled = False
+      setWorkflowStatus(self.statusLbl, "needs_input", "Select valid mesh and correspondence folders.")
+      return
+    dMeshes = os.path.abspath(os.path.expanduser(mesh_text))
+    dMrk = os.path.abspath(os.path.expanduser(mrk_text))
     if not (os.path.isdir(dMeshes) and os.path.isdir(dMrk)):
       self.runBtn.enabled = False
       setWorkflowStatus(self.statusLbl, "needs_input", "Select valid mesh and correspondence folders.")
       return
-    mesh_files = [f for f in os.listdir(dMeshes) if os.path.splitext(f)[1].lower() in {".ply",".stl",".obj",".vtp",".vtk"}]
-    mrk_files = [f for f in os.listdir(dMrk) if f.lower().endswith(".mrk.json")]
-    mesh_bases = {os.path.splitext(f)[0].lower() for f in mesh_files}
-    mrk_bases = {os.path.splitext(os.path.splitext(f)[0])[0].lower() for f in mrk_files}
-    pairs = len(mesh_bases & mrk_bases)
-    out_ok = bool(dOut)
-    self.runBtn.enabled = pairs > 0 and out_ok
+    try:
+      pairs = len(self.logic._pair_files(dMeshes, dMrk))
+    except ValueError as exc:
+      self.runBtn.enabled = False
+      setWorkflowStatus(self.statusLbl, "needs_input", str(exc))
+      return
+    self.runBtn.enabled = pairs > 0 and bool(out_text)
     if pairs == 0:
       setWorkflowStatus(self.statusLbl, "needs_input", "No matching mesh and .mrk.json filenames were found.")
-    elif not out_ok:
+    elif not out_text:
       setWorkflowStatus(self.statusLbl, "needs_input", "Choose an output folder.")
     else:
       setWorkflowStatus(self.statusLbl, "ready", f"{pairs} paired specimens detected.")
 
   def onRun(self):
+    if not all(self._t(w) for w in (self.meshDir, self.mrkDir, self.outDir)):
+      slicer.util.errorDisplay("Select input folders and an explicit output folder."); return
     dMeshes=os.path.abspath(os.path.expanduser(self._t(self.meshDir)))
     dMrk=os.path.abspath(os.path.expanduser(self._t(self.mrkDir)))
     dOut=os.path.abspath(os.path.expanduser(self._t(self.outDir)))
     if not (os.path.isdir(dMeshes) and os.path.isdir(dMrk)):
       slicer.util.errorDisplay("Input folders not found."); return
-    os.makedirs(dOut,exist_ok=True)
+    # Output creation is handled inside the guarded logic call below.
 
     # parse grids (robust to commas/semicolons/extra spaces)
     def _parse_ints(s):
@@ -141,12 +150,22 @@ class MorphoWeaveSurfaceSegmentationWidget(ScriptedLoadableModuleWidget):
         k=int(self._spin(self.kSeg)), knn=int(self._spin(self.knn)),
         smooth_iters=int(self._spin(self.smooth)), alpha=float(self._spin(self.alpha)),
         write_vtp=self._checked(self.saveVTP), previewN=int(self._spin(self.previewN)),
-        auto_tune=auto, k_grid=k_grid, alpha_grid=a_grid
+        auto_tune=auto, k_grid=k_grid, alpha_grid=a_grid,
+        write_ply_segments=self._checked(self.savePLY)
       )
-      msg = f"Surface Segmentation: {res['n_pairs']} pairs, k={res['k']}, wrote={res['wrote']}"
+      msg = (f"Surface Segmentation: {res['n_used']}/{res['n_pairs']} specimens used, "
+             f"{res['n_skipped']} skipped, {res['n_export_failed']} export failures; "
+             f"k={res['k']}, {res['wrote']} mesh files written")
       if 'Q' in res: msg += f", Q={res['Q']:.3f}"
       slicer.util.showStatusMessage(msg)
-      setWorkflowStatus(self.statusLbl, "complete", f"Run finished. Outputs: {dOut}")
+      issues = [f"{os.path.basename(f['mesh'])} ({f['stage']}): {f['error']}" for f in res['failures']]
+      issues.extend(res['warnings'])
+      state = "warning" if issues else "complete"
+      detail = msg + f". Outputs: {dOut}"
+      if issues:
+        detail += "\n" + "\n".join(issues)
+        slicer.util.warningDisplay(detail)
+      setWorkflowStatus(self.statusLbl, state, detail)
       logging.info(res)
 
 
@@ -154,15 +173,27 @@ class MorphoWeaveSurfaceSegmentationLogic(ScriptedLoadableModuleLogic):
   def run(self, meshes_dir, mrk_dir, out_dir,
           k=15, knn=12, smooth_iters=1, alpha=0.7,
           write_vtp=True, previewN=3,
-          auto_tune=False, k_grid=None, alpha_grid=None):
+          auto_tune=False, k_grid=None, alpha_grid=None, write_ply_segments=False):
 
-    self._clear_preview_nodes(); pairs=self._pair_files(meshes_dir,mrk_dir)
+    if out_dir is None or not str(out_dir).strip():
+      raise ValueError("Select an explicit output folder.")
+    pairs = self._pair_files(meshes_dir, mrk_dir)
     if not pairs: raise RuntimeError("No mesh↔.mrk.json pairs found.")
-    ok,M=self._validate_mrk_counts([m for _,m in pairs]);
+    ok, M = self._validate_mrk_counts([m for _, m in pairs])
     if not ok: raise RuntimeError("Dense correspondences count mismatch.")
-    loci_mean=self._mean_loci([m for _,m in pairs],M); A_geo=self._knn_graph(loci_mean,knn)
+    if M is None or M < 3:
+      raise ValueError("Surface segmentation requires at least 3 corresponding loci per specimen.")
+    for k_value in (k_grid or [k]) if auto_tune else [k]:
+      self._validate_cluster_count(M, k_value)
+    for a_value in (alpha_grid or [alpha]) if auto_tune else [alpha]:
+      if not np.isfinite(a_value) or not 0.0 <= a_value <= 1.0:
+        raise ValueError("Feature weight alpha must be finite and between 0 and 1.")
+    if int(knn) != knn or knn < 1:
+      raise ValueError("kNN must be a positive integer.")
+    os.makedirs(out_dir, exist_ok=True)
+    self._clear_preview_nodes()
     feats = []; cache = {}
-    used_pairs = []; skipped = []
+    used_pairs = []; failures = []; warnings = []
 
     # If you want to see mesh name inside lower helpers for logging:
     self._current_mesh = None
@@ -183,29 +214,32 @@ class MorphoWeaveSurfaceSegmentationLogic(ScriptedLoadableModuleLogic):
           include_normal_var=True,
           include_axis_orient=True,
           pool_hops=1,
-          include_hks=False,   # keep HKS on
+          include_hks=False,   # HKS remains optional and disabled by default
           hks_k=30, hks_times=6
         )
 
+        self._assert_finite("features", F_locus, meshPath)
         feats.append(F_locus)
         used_pairs.append((meshPath, mrkPath))
 
       except Exception as e:
         logging.warning(f"[MorphoWeaveSurfaceSegmentation] Skipping '{os.path.basename(meshPath)}' due to {type(e).__name__}: {e}")
-        skipped.append((meshPath, mrkPath))
+        failures.append({"mesh": meshPath, "markups": mrkPath,
+                         "stage": "feature extraction", "error": f"{type(e).__name__}: {e}"})
         continue
 
     self._current_mesh = None
 
     if not used_pairs:
-      raise RuntimeError("All meshes failed during feature extraction.")
+      detail = "; ".join(f"{os.path.basename(f['mesh'])}: {f['error']}" for f in failures)
+      raise RuntimeError("All meshes failed during feature extraction. " + detail)
 
-    # (Optional but better) recompute loci_mean/A_geo on the used subset
+    # Construct the spatial graph only from specimens actually used.
     M = feats[0].shape[0]
     loci_mean = self._mean_loci([m for _, m in used_pairs], M)
     A_geo = self._knn_graph(loci_mean, knn)
 
-    # ensure consistent feature width (HKS may fail on some and be zero-filled; see step 2)
+    # Ensure consistent feature width (optional HKS failures are zero-filled).
     Dmax = max(f.shape[1] for f in feats)
     if any(f.shape[1] != Dmax for f in feats):
       logging.warning("[MorphoWeaveSurfaceSegmentation] Feature dimension mismatch; padding to D=%d", Dmax)
@@ -226,44 +260,93 @@ class MorphoWeaveSurfaceSegmentationLogic(ScriptedLoadableModuleLogic):
       Q = self._modularity(W, labels)
       logging.info(f"[MorphoWeaveSurfaceSegmentation] Q={Q:.4f} (k={k}, α={alpha:.3f})")
 
-    # write only used_pairs
-    wrote = 0
-    self._ensure_color_table("MorphoWeaveSurfaceSegmentation_Colors", int(labels.max()+1))
+    # Export exactly the cached world-coordinate geometry used for labeling.
+    # Keep raw and smoothed point labels separate in the complete VTP surface.
+    output_files = []; export_failed = set(); segment_reports = []
     for i, (meshPath, mrkPath) in enumerate(used_pairs):
-      V, F, pdW = cache[meshPath]
-      P = self._load_mrk_positions_world(mrkPath)
-      labV = self._project_labels(V, P, labels)
-      labV = self._smooth_labels(V, F, labV, smooth_iters)
+      try:
+        V, F, pdW = cache[meshPath]
+        P = self._load_mrk_positions_world(mrkPath)
+        labV_raw = self._project_labels(V, P, labels)
+        labV_smooth = self._smooth_labels(V, F, labV_raw.copy(), smooth_iters)
+      except Exception as exc:
+        export_failed.add(meshPath)
+        failures.append({"mesh": meshPath, "markups": mrkPath,
+                         "stage": "label projection", "error": f"{type(exc).__name__}: {exc}"})
+        continue
       if write_vtp:
-        #self._write_vtp_with_labels_world(meshPath, out_dir, labV, labV); wrote += 1 # TO DO
-        self._write_ply_segments(pdW, out_dir, labV, os.path.basename(meshPath)); wrote += 1
+        try:
+          output_files.append(self._write_vtp_with_labels_world(
+            meshPath, out_dir, labV_raw, labV_smooth, pdW=pdW))
+        except Exception as exc:
+          export_failed.add(meshPath)
+          failures.append({"mesh": meshPath, "markups": mrkPath,
+                           "stage": "VTP export", "error": f"{type(exc).__name__}: {exc}"})
+      if write_ply_segments:
+        try:
+          report = self._write_ply_segments(pdW, out_dir, labV_smooth, os.path.basename(meshPath))
+        except Exception as exc:
+          export_failed.add(meshPath)
+          failures.append({"mesh": meshPath, "markups": mrkPath,
+                           "stage": "PLY export", "error": f"{type(exc).__name__}: {exc}"})
+          report = None
+        if report is not None:
+          segment_reports.append(dict(report, mesh=meshPath))
+          output_files.extend(report['files'])
+          for error in report['failures']:
+            export_failed.add(meshPath)
+            failures.append({"mesh": meshPath, "markups": mrkPath,
+                             "stage": "PLY export", "error": error})
+          if report['excluded_cells'] or report['empty_segments']:
+            warnings.append(
+              f"{os.path.basename(meshPath)}: PLY interiors omit {report['excluded_cells']} "
+              f"mixed/unlabeled cells; segments with no interior cells: {report['empty_segments']}. "
+              "Use labeled VTP for the complete surface.")
       if i < previewN:
-        # self._preview_in_scene(meshPath, labV) # TO DO
-        self._preview_in_scene(n_name=os.path.splitext(os.path.basename(meshPath))[0], labV=labV, pdW=pdW)
+        try:
+          self._preview_in_scene(n_name=os.path.splitext(os.path.basename(meshPath))[0], labV=labV_smooth, pdW=pdW)
+        except Exception as exc:
+          warnings.append(f"{os.path.basename(meshPath)}: preview failed: {exc}")
 
-    self._save_labels_lookup(out_dir, labels)
-
+    lookup_files = self._save_labels_lookup(out_dir, labels)
     return {
       "n_pairs": len(pairs),
       "n_used": len(used_pairs),
-      "n_skipped": len(skipped),
+      "n_skipped": len(pairs) - len(used_pairs),
+      "n_export_failed": len(export_failed),
+      "failures": failures,
+      "warnings": warnings,
+      "output_files": output_files,
+      "lookup_files": lookup_files,
+      "segment_reports": segment_reports,
       "k": int(k),
-      "wrote": wrote,
+      "n_segments": int(len(np.unique(labels))),
+      "wrote": len(output_files),
       "M": int(M),
       "Q": float(Q)
     }
 
 
   def _pair_files(self, meshes_dir, mrk_dir):
-    ex_mesh={".ply",".stl",".obj",".vtp",".vtk"}
-    meshFiles=[f for f in os.listdir(meshes_dir) if os.path.splitext(f)[1].lower() in ex_mesh]
-    mrkFiles=[f for f in os.listdir(mrk_dir) if f.lower().endswith(".mrk.json")]
-    mByBase={os.path.splitext(f)[0]:os.path.join(meshes_dir,f) for f in meshFiles}
-    pairs=[]
-    for g in mrkFiles:
-      base=os.path.splitext(os.path.splitext(g)[0])[0]
-      if base in mByBase: pairs.append((mByBase[base], os.path.join(mrk_dir,g)))
-    pairs.sort(key=lambda x: os.path.basename(x[0]).lower()); return pairs
+    """Pair case-insensitively, rejecting every ambiguous/output-colliding stem."""
+    ex_mesh = {".ply", ".stl", ".obj", ".vtp", ".vtk"}
+    def index_files(directory, is_supported, stem):
+      by_base = {}
+      for name in sorted(os.listdir(directory)):
+        if not is_supported(name) or not os.path.isfile(os.path.join(directory, name)):
+          continue
+        key = stem(name).casefold()
+        if key in by_base:
+          raise ValueError(f"Duplicate specimen stem in '{directory}': "
+                           f"'{os.path.basename(by_base[key])}' and '{name}'. "
+                           "Keep only one mesh and one markup file per stem.")
+        by_base[key] = os.path.join(directory, name)
+      return by_base
+    meshes = index_files(meshes_dir, lambda n: os.path.splitext(n)[1].lower() in ex_mesh,
+                         lambda n: os.path.splitext(n)[0])
+    markups = index_files(mrk_dir, lambda n: n.lower().endswith(".mrk.json"),
+                          lambda n: n[:-len(".mrk.json")])
+    return [(meshes[key], markups[key]) for key in sorted(meshes.keys() & markups.keys())]
 
   def _validate_mrk_counts(self, mrk_paths):
     c=None
@@ -430,10 +513,30 @@ class MorphoWeaveSurfaceSegmentationLogic(ScriptedLoadableModuleLogic):
   def _umbrella_curv_proxy(self,V,A):
     deg=np.asarray(A.sum(1)).ravel(); L=diags(deg)-A; Hn=(L@V); H=np.linalg.norm(Hn,axis=1)/np.maximum(deg,1); return H
 
-  def _knn_graph(self,P,knn):
-    t=cKDTree(P); d,idx=t.query(P,k=min(knn+1,len(P))); idx=idx[:,1:]; d=d[:,1:]
-    I=np.repeat(np.arange(len(P)), idx.shape[1]); J=idx.ravel(); sig=np.median(d)+1e-12
-    W=np.exp(-(d.ravel()**2)/(sig**2)); A=coo_matrix((W,(I,J)),shape=(len(P),len(P))).tocsr(); A=A.maximum(A.T); A.setdiag(0); A.eliminate_zeros(); return A
+  def _knn_graph(self, P, knn):
+    P = np.asarray(P, dtype=float)
+    if P.ndim != 2 or P.shape[1] != 3 or not np.isfinite(P).all():
+      raise ValueError("Locus coordinates must be a finite N-by-3 array.")
+    if int(knn) != knn or knn < 1:
+      raise ValueError("kNN must be a positive integer.")
+    n = len(P)
+    if n < 2:
+      return coo_matrix((n, n)).tocsr()
+    width = min(int(knn), n - 1)
+    distances, neighbors = cKDTree(P).query(P, k=width + 1)
+    # Remove the query vertex explicitly: coincident loci can change tie order.
+    idx = np.empty((n, width), dtype=np.int64)
+    d = np.empty((n, width), dtype=float)
+    for row in range(n):
+      keep = neighbors[row] != row
+      idx[row] = neighbors[row][keep][:width]
+      d[row] = distances[row][keep][:width]
+    I = np.repeat(np.arange(n), width); J = idx.ravel()
+    sig = np.median(d) + 1e-12
+    weights = np.exp(-(d.ravel() ** 2) / (sig ** 2))
+    A = coo_matrix((weights, (I, J)), shape=(n, n)).tocsr()
+    A = A.maximum(A.T); A.setdiag(0); A.eliminate_zeros()
+    return A
 
   def _loci_kernel_multi(self,loci, feats_stack, A_geo, alpha):
     """
@@ -474,11 +577,31 @@ class MorphoWeaveSurfaceSegmentationLogic(ScriptedLoadableModuleLogic):
     W.setdiag(0); W.eliminate_zeros()
     return W
 
-  def _spectral_cluster(self,W,k):
-    n=W.shape[0]; k=min(max(2,k),max(2,n-1))
-    D=diags(np.asarray(W.sum(1)).ravel()); L=diags(np.ones(n))-D.power(-0.5)@W@D.power(-0.5)
-    _,vecs=eigsh(L,k=k,which='SM',tol=1e-6); X=vecs/np.maximum(np.linalg.norm(vecs,axis=1,keepdims=True),1e-12)
-    _,labels=kmeans2(X,k,minit='++',iter=60); return labels.astype(np.int32)
+  def _validate_cluster_count(self, n, k):
+    if n < 3:
+      raise ValueError("Surface segmentation requires at least 3 corresponding loci per specimen.")
+    if int(k) != k or not 2 <= k < n:
+      raise ValueError(f"Number of segments must be an integer between 2 and {n - 1} for {n} loci.")
+
+  def _spectral_cluster(self, W, k):
+    n = W.shape[0]
+    self._validate_cluster_count(n, k)
+    if W.shape != (n, n):
+      raise ValueError("The locus affinity matrix must be square.")
+    W = W.tocsr()
+    if not np.isfinite(W.data).all() or np.any(W.data < 0):
+      raise ValueError("Locus affinities must be finite and nonnegative.")
+    if (W - W.T).nnz and np.max(np.abs((W - W.T).data)) > 1e-10:
+      raise ValueError("The locus affinity matrix must be symmetric.")
+    degree = np.asarray(W.sum(1)).ravel()
+    if np.any(degree <= 0):
+      raise ValueError("Every locus needs a positive-weight graph neighbor; increase kNN or check coordinates.")
+    invsqrt = diags(1.0 / np.sqrt(degree))
+    L = diags(np.ones(n)) - invsqrt @ W @ invsqrt
+    _, vecs = eigsh(L, k=int(k), which='SM', tol=1e-6)
+    X = vecs / np.maximum(np.linalg.norm(vecs, axis=1, keepdims=True), 1e-12)
+    _, labels = kmeans2(X, int(k), minit='++', iter=60)
+    return labels.astype(np.int32)
 
   def _project_labels(self,V,P_loci,labels):
     nn=cKDTree(P_loci).query(V,k=1)[1]; return labels[nn]
@@ -492,31 +615,91 @@ class MorphoWeaveSurfaceSegmentationLogic(ScriptedLoadableModuleLogic):
       maj=np.argmax(votes,1); lab=np.where(deg>0,maj,lab)
     return lab
 
-# TO DO: substitute _write_ply_segments() to save ply's of each segment instead of a colored vtp
-  def _write_vtp_with_labels_world(self,meshPath,out_dir,labV_raw,labV_smooth):
-    n=self._load_model_node(meshPath); pdW=self._polydata_world(n)
-    a1=vtk_np.numpy_to_vtk(labV_raw, deep=True, array_type=vtk.VTK_INT); a1.SetName("SegID"); pdW.GetPointData().AddArray(a1)
-    a2=vtk_np.numpy_to_vtk(labV_smooth, deep=True, array_type=vtk.VTK_INT); a2.SetName("SegID_smooth"); pdW.GetPointData().AddArray(a2); pdW.GetPointData().SetActiveScalars("SegID_smooth")
-    w=vtk.vtkXMLPolyDataWriter(); base=os.path.splitext(os.path.basename(meshPath))[0]; out=os.path.join(out_dir,base+"_seg.vtp"); w.SetFileName(out); w.SetInputData(pdW); w.Write()
-    slicer.mrmlScene.RemoveNode(n)
+  def _checked_polydata_write(self, writer, pd, out_path):
+    """Write a new temporary file, then replace the destination only on success."""
+    if pd.GetNumberOfPoints() == 0 or pd.GetNumberOfCells() == 0:
+      raise RuntimeError(f"No surface data to write: {out_path}")
+    fd, temporary = tempfile.mkstemp(prefix=".morphoweave-", suffix=os.path.splitext(out_path)[1],
+                                     dir=os.path.dirname(os.path.abspath(out_path)))
+    os.close(fd)
+    try:
+      writer.SetFileName(temporary); writer.SetInputData(pd)
+      status = writer.Write()
+      if status != 1 or writer.GetErrorCode() != 0 or not os.path.isfile(temporary) or os.path.getsize(temporary) == 0:
+        raise IOError(f"Failed to write mesh: {out_path} (VTK error {writer.GetErrorCode()}).")
+      os.replace(temporary, out_path)
+      return out_path
+    finally:
+      if os.path.exists(temporary):
+        os.remove(temporary)
 
-# TO DO: added func to output ply segments
-  def _write_ply_segments(self, pdW, out_dir, labels, meshBasename):
+  def _validate_vertex_labels(self, pd, labels):
+    values = np.asarray(labels)
+    if values.ndim != 1 or len(values) != pd.GetNumberOfPoints():
+      raise ValueError("Exactly one label is required for each mesh vertex.")
+    if (not np.isfinite(values).all() or np.any(values != np.floor(values))
+        or np.any(values < -1) or np.any(values > np.iinfo(np.int32).max)):
+      raise ValueError("Vertex labels must be finite integers from -1 through INT32_MAX.")
+    return values.astype(np.int32)
+
+  def _write_vtp_with_labels_world(self, meshPath, out_dir, labV_raw, labV_smooth, pdW=None):
+    node = None
+    try:
+      if pdW is None:
+        node = self._load_model_node(meshPath)
+        pdW = self._polydata_world(node)
       pd = vtk.vtkPolyData(); pd.DeepCopy(pdW)
-      arr = vtk_np.numpy_to_vtk(labels.astype(np.int32), deep=True, array_type=vtk.VTK_INT)
-      arr.SetName("SegID"); pd.GetPointData().SetScalars(arr)
-      base = os.path.splitext(meshBasename)[0]
-      for seg in np.unique(labels):
-          if seg < 0: continue
-          t = vtk.vtkThreshold(); t.SetInputData(pd)
-          t.SetInputArrayToProcess(0,0,0,vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS,"SegID")
-          t.SetLowerThreshold(float(seg)-0.5); t.SetUpperThreshold(float(seg)+0.5); t.Update()
-          g = vtk.vtkGeometryFilter(); g.SetInputConnection(t.GetOutputPort()); g.Update()
-          nf = vtk.vtkPolyDataNormals(); nf.SetInputConnection(g.GetOutputPort())
-          nf.SplittingOff(); nf.ConsistencyOn(); nf.Update()
-          w = vtk.vtkPLYWriter()
-          w.SetFileName(os.path.join(out_dir, f"{base}_seg_{int(seg):02d}.ply"))
-          w.SetInputConnection(nf.GetOutputPort()); w.SetFileTypeToBinary(); w.Write()
+      for name, labels in (("SegID", labV_raw), ("SegID_smooth", labV_smooth)):
+        values = self._validate_vertex_labels(pd, labels)
+        arr = vtk_np.numpy_to_vtk(values, deep=True, array_type=vtk.VTK_INT)
+        arr.SetName(name); pd.GetPointData().AddArray(arr)
+      pd.GetPointData().SetActiveScalars("SegID_smooth")
+      base = os.path.splitext(os.path.basename(meshPath))[0]
+      out = os.path.join(out_dir, base + "_seg.vtp")
+      return self._checked_polydata_write(vtk.vtkXMLPolyDataWriter(), pd, out)
+    finally:
+      if node is not None:
+        slicer.mrmlScene.RemoveNode(node)
+
+  def _write_ply_segments(self, pdW, out_dir, labels, meshBasename):
+    """Optional eroded interiors, NOT an exhaustive partition of the surface.
+
+    A cell is retained only when all its vertices have the same nonnegative
+    label. Mixed-label cells are deliberately omitted and reported; complete
+    geometry and both point-label arrays are available in the labeled VTP.
+    """
+    labels = self._validate_vertex_labels(pdW, labels)
+    pd = vtk.vtkPolyData(); pd.DeepCopy(pdW)
+    arr = vtk_np.numpy_to_vtk(labels, deep=True, array_type=vtk.VTK_INT)
+    arr.SetName("SegID"); pd.GetPointData().SetScalars(arr)
+    base = os.path.splitext(meshBasename)[0]
+    report = {"files": [], "failures": [], "empty_segments": [],
+              "total_cells": pd.GetNumberOfCells(), "interior_cells": 0,
+              "written_cells": 0, "excluded_cells": 0}
+    for seg in np.unique(labels):
+      if seg < 0: continue
+      t = vtk.vtkThreshold(); t.SetInputData(pd)
+      t.SetInputArrayToProcess(0, 0, 0, vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS, "SegID")
+      t.SetLowerThreshold(float(seg) - 0.5); t.SetUpperThreshold(float(seg) + 0.5)
+      t.SetThresholdFunction(vtk.vtkThreshold.THRESHOLD_BETWEEN)
+      t.AllScalarsOn(); t.Update()
+      g = vtk.vtkGeometryFilter(); g.SetInputConnection(t.GetOutputPort()); g.Update()
+      count = g.GetOutput().GetNumberOfCells()
+      report['interior_cells'] += count
+      if count == 0:
+        report['empty_segments'].append(int(seg))
+        continue
+      nf = vtk.vtkPolyDataNormals(); nf.SetInputConnection(g.GetOutputPort())
+      nf.SplittingOff(); nf.ConsistencyOn(); nf.Update()
+      writer = vtk.vtkPLYWriter(); writer.SetFileTypeToBinary()
+      path = os.path.join(out_dir, f"{base}_seg_{int(seg):02d}.ply")
+      try:
+        report['files'].append(self._checked_polydata_write(writer, nf.GetOutput(), path))
+        report['written_cells'] += count
+      except Exception as exc:
+        report['failures'].append(f"{os.path.basename(path)}: {type(exc).__name__}: {exc}")
+    report['excluded_cells'] = report['total_cells'] - report['interior_cells']
+    return report
 
   def _preview_in_scene(self, n_name, labV, pdW):
       pd = vtk.vtkPolyData(); pd.DeepCopy(pdW)
@@ -548,8 +731,11 @@ class MorphoWeaveSurfaceSegmentationLogic(ScriptedLoadableModuleLogic):
       if node and node.GetName().endswith("_seg_preview"): slicer.mrmlScene.RemoveNode(node)
 
   def _save_labels_lookup(self,out_dir,labels):
-    np.save(os.path.join(out_dir,"MorphoWeaveSurfaceSegmentation_locus_labels.npy"), labels)
-    with open(os.path.join(out_dir,"MorphoWeaveSurfaceSegmentation_locus_labels.txt"),"w") as f: f.write("\n".join(map(str,labels.tolist())))
+    paths = [os.path.join(out_dir, "MorphoWeaveSurfaceSegmentation_locus_labels" + ext)
+             for ext in (".npy", ".txt")]
+    np.save(paths[0], labels)
+    with open(paths[1], "w") as f: f.write("\n".join(map(str, labels.tolist())))
+    return paths
 
   def _ensure_color_table(self, name, k):
     ctn = slicer.mrmlScene.GetFirstNodeByName(name)
@@ -623,10 +809,12 @@ class MorphoWeaveSurfaceSegmentationLogic(ScriptedLoadableModuleLogic):
     return k1, k2
 
   def _shape_index_curvedness(self, k1, k2):
-    # Koenderink shape index S \in [-1,1], curvedness C >= 0
-    eps = 1e-12
-    S = (2.0/np.pi) * np.arctan2(k1 + k2, (k1 - k2) + eps)
-    C = np.sqrt(0.5*(k1*k1 + k2*k2))
+    # The separate principal-curvature features retain magnitude ordering.
+    # Shape index instead requires signed ordering: kmax - kmin >= 0.
+    # atan2(0, 0) defines the flat-point convention S=0, C=0.
+    kmax, kmin = np.maximum(k1, k2), np.minimum(k1, k2)
+    S = (2.0 / np.pi) * np.arctan2(kmax + kmin, kmax - kmin)
+    C = np.sqrt(0.5 * (kmax*kmax + kmin*kmin))
     return S, C
 
   def _smooth_polydata(self, pd, iters):
@@ -805,9 +993,10 @@ class MorphoWeaveSurfaceSegmentationLogic(ScriptedLoadableModuleLogic):
       cu = np.einsum('ij,ij->i', u, v)
       su = np.linalg.norm(np.cross(u, v), axis=1) + 1e-12
       return cu / su
-    cotA = cot(v1, v2, v0)
-    cotB = cot(v2, v0, v1)
-    cotC = cot(v0, v1, v2)
+    # Angle at i is opposite edge (j, k), and likewise cyclically.
+    cotA = cot(v0, v1, v2)
+    cotB = cot(v1, v2, v0)
+    cotC = cot(v2, v0, v1)
     I = np.r_[i,j,j,k,k,i]
     J = np.r_[j,i,k,j,i,k]
     W = np.r_[cotC,cotC,cotA,cotA,cotB,cotB] * 0.5
@@ -823,9 +1012,13 @@ class MorphoWeaveSurfaceSegmentationLogic(ScriptedLoadableModuleLogic):
     return L, M
 
   def _lb_eigens(self, V, F, k=30):
+    if len(V) < 3 or len(F) == 0:
+      raise ValueError("HKS requires at least 3 vertices and a triangle.")
+    if int(k) != k or k < 2:
+      raise ValueError("HKS eigenvector count must be an integer of at least 2.")
     L, M = self._cotangent_laplacian(V, F)
-    # shift-invert around small positive sigma for stability
-    kk = max(2, min(k, L.shape[0]-2))
+    # eigsh requires k < N, including on a single-triangle surface.
+    kk = min(int(k), L.shape[0] - 1)
     vals, vecs = eigsh(L, k=kk, M=M, sigma=1e-8, which='LM', tol=1e-6)
     vals = np.maximum(vals, 1e-12)
     return vals, vecs
