@@ -51,6 +51,28 @@ be assumed to reproduce bit-for-bit.
   use the corrected prior. Full tiny3d optimization is not exercised by the
   standalone regression; the production nested scoring/pruning functions are.
 
+## Defaults and rigid search (performance update)
+
+LT-01 makes the PCA-CPD prior unit-consistent. With that fix, the former `lambda_reg = 0.01` corresponds to an almost flat shape prior: the old default only worked because the unit error inflated it by about 10³ for Procrustes-scaled data. Held-out evaluation (40 units each of mouse skulls, primate molars and lizard vertebrae) showed that LT-01 with λ = 0.01 increases mouse error from 0.85% to 2.3–2.5% of the bbox diagonal, and causes 12–16/40 vertebra failures even for aligned targets. The defaults are therefore:
+
+- `lambda_reg = 1.0`; `alpha = 8` for the fine CPD; `outlier_weight = w` is passed to the fine CPD;
+- `skipOptimization = True`: the legacy FPFH template optimizer doubled runtime without changing accuracy;
+- `featureFreeRigid = True`: the rigid stage is the SSM global pose search shared with Shape Completion (`global_pose_search`, imported from `MorphoWeaveShapeCompletionPipeline`).
+  - It combines 4 pose-EM seeds with the 4 principal-axis alignments, and selects by penalized likelihood.
+  - Target subsampling is in NumPy (identical to tiny3d's voxel downsampling).
+  - tiny3d is imported only for `featureFreeRigid = False` (RANSAC/ICP, optionally with `rigidSearch` pose-EM selection), the legacy optimizer, and Single Run's Subsample/Align buttons.
+
+Gross failures (> 4% of diagonal) out of 40 per dataset, mouse / molar / vertebrae:
+
+| Regime | Audit defaults | This branch |
+|---|---|---|
+| aligned | 8 / 0 / 16 | **0 / 0 / 0** |
+| severe rotation | 5 / 0 / 16 | **0 / 0 / 0** |
+| random SO(3) rotation | 9 / 2 / 14 | **0 / 0 / 0** |
+| severe rotation, coordinates ×100 | 5 / 0 / 12 | **0 / 0 / 0** |
+
+Median errors on this branch are 0.81–0.83 / 1.80–1.87 / 1.50–1.55% of the diagonal. That is equal to or better than the original module, with mouse 0.03 points better (p ≤ 0.01).
+
 ## Batch result and failure contract (LT-09)
 
 `runLandmarkBatch` now returns a dictionary:

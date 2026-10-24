@@ -435,6 +435,15 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
         self.variance_keep.value = 0.95
         self.variance_keep.setDecimals(2)
         form.addRow("Retained SSM variance:", self.variance_keep)
+        self.pipeline_combo = qt.QComboBox()
+        self.pipeline_combo.addItems(["Robust (recommended)", "Legacy (pre-benchmark behaviour)"])
+        self.pipeline_combo.setCurrentIndex(0)
+        self.pipeline_combo.setToolTip(
+            "Robust: convex-hull size estimate, state continuation, adaptive mixing, FPFH/RANSAC "
+            "pose proposals selected by SSM likelihood, density-matched refit and a posterior prior "
+            "matched to the atlas fit. Legacy reproduces earlier results exactly."
+        )
+        form.addRow("Registration pipeline:", self.pipeline_combo)
         self.registration_point_count = qt.QSpinBox()
         self.registration_point_count.minimum = 100
         self.registration_point_count.maximum = 1000000
@@ -536,7 +545,7 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
         )
         seeding_intro.setWordWrap(True)
         seeding.addRow(seeding_intro)
-        self.pose_anchor_count = self._spin(1, 32, 6)
+        self.pose_anchor_count = self._spin(1, 32, 8)
         self.pose_anchor_count.setToolTip(
             "Translation seeds per rotation. 1 reproduces the classic centroid seed. Coarse-stage cost scales with this value; refinement cost does not."
         )
@@ -934,6 +943,7 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
             adaptive_mixing=None if mixing_alpha <= 0.0 else mixing_alpha,
             initial_sigma2=None if initial_sigma2 <= 0.0 else initial_sigma2,
             merge_tolerance=float(self.pose_merge_tolerance.value),
+            pipeline="robust" if int(self.pipeline_combo.currentIndex) == 0 else "legacy",
         )
 
     def _settings_snapshot(self, settings):
@@ -1210,6 +1220,7 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
             settings,
             rustcpd_module=rustcpd,
             landmarks=landmarks,
+            template_points=self.logic.model_points_world(template_model),
         )
         self.run_progress.setValue(75)
         slicer.app.processEvents()
@@ -1330,6 +1341,10 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
         if self.calibration_use_landmarks.checked and sparse_template is None:
             raise ValueError("landmark calibration requires template sparse landmarks")
         mean, modes, eigenvalues = self.logic.ssm_from_table(table_node)
+        calibration_template_points = (
+            self.logic.model_points_world(self.template_model_selector.currentNode())
+            if self.template_model_selector.currentNode() is not None else None
+        )
         dense_template_points = self.logic.markups_points_world(dense_template)
         if len(dense_template_points) != len(mean):
             raise ValueError("template dense correspondences do not match the SSM point count")
@@ -1529,6 +1544,7 @@ class MorphoWeaveShapeCompletionWidget(ScriptedLoadableModuleWidget):
                                 settings,
                                 rustcpd_module=rustcpd,
                                 landmarks=landmarks,
+                                template_points=calibration_template_points,
                             )
                             if truth_type == "exact_dense_correspondence":
                                 errors_all = np.linalg.norm(

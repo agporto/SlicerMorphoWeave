@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import sys
 from pathlib import Path
 import time
 from typing import Any, Mapping, Optional, Sequence
@@ -14,11 +15,12 @@ import numpy as np
 DEFAULT_COVERAGE = 1.0
 LANDMARK_RECOMMENDED_BELOW = 0.75
 PROFILE_VERSION = 2
-CALIBRATION_ALGORITHM_VERSION = "3-normalized-atlas-triangle-validation"
+CALIBRATION_ALGORITHM_VERSION = "4-robust-pipeline-option"
 _CALIBRATION_SOURCE_FILES = (
     "MorphoWeaveShapeCompletionCore.py",
     "MorphoWeaveShapeCompletionBase.py",
     "MorphoWeaveShapeCompletionGeometry.py",
+    "MorphoWeaveShapeCompletionPipeline.py",
 )
 _TINY = 1e-12
 
@@ -109,6 +111,22 @@ class CompletionSettings:
     # and lets the first EM steps re-centre the SSM on the fragment, undoing
     # the pose search. None restores the classic estimate.
     atlas_sigma2_from_pose_factor: Optional[float] = 2.0
+    # "legacy" keeps the registration path above unchanged; "robust" uses
+    # MorphoWeaveShapeCompletionPipeline.register_robust (hull-volume size
+    # estimate, state continuation, adaptive mixing, FPFH/RANSAC proposals
+    # selected by penalized likelihood, density-matched refit, prior
+    # temperature matched to the atlas). The widget selects "robust".
+    pipeline: str = "legacy"
+    robust_scale_margin: float = 0.10
+    robust_adaptive_mixing: float = 1.0
+    robust_pose_seeds: int = 4
+    robust_region_proposals: int = 16
+    # FPFH + RANSAC proposals (tiny3d), off by default: not needed (see pipeline docstring).
+    robust_ransac_hypotheses: int = 0
+    robust_screen_iterations: int = 30
+    robust_screen_points: int = 400
+    robust_refine_proposals: int = 2
+    robust_density_refit: bool = True
 
     def validate(self) -> None:
         if not 0.05 <= float(self.coverage) <= 1.0:
@@ -172,6 +190,18 @@ class CompletionSettings:
             raise ValueError("initial_sigma2 must be positive or None")
         if float(self.merge_tolerance) < 0.0:
             raise ValueError("merge_tolerance cannot be negative")
+        if self.pipeline not in {"legacy", "robust"}:
+            raise ValueError("pipeline must be legacy or robust")
+        if not 0.0 < float(self.robust_scale_margin) < 1.0:
+            raise ValueError("robust_scale_margin must be in (0, 1)")
+        if float(self.robust_adaptive_mixing) <= 0.0:
+            raise ValueError("robust_adaptive_mixing must be positive")
+        if int(self.robust_screen_points) < 20:
+            raise ValueError("robust_screen_points must be at least 20")
+        if int(self.robust_pose_seeds) < 1 or int(self.robust_region_proposals) < 0:
+            raise ValueError("robust_pose_seeds must be >= 1 and robust_region_proposals >= 0")
+        if int(self.robust_ransac_hypotheses) < 0 or int(self.robust_screen_iterations) < 1 or int(self.robust_refine_proposals) < 1:
+            raise ValueError("robust proposal settings must be non-negative/positive")
         if self.atlas_sigma2_from_pose_factor is not None and not (
             float(self.atlas_sigma2_from_pose_factor) > 0.0
         ):
@@ -932,6 +962,7 @@ def run_completion(
     *,
     rustcpd_module: Any,
     landmarks: Optional[LandmarkMatch] = None,
+    template_points: Optional[np.ndarray] = None,
 ) -> CompletionResult:
     settings.validate()
     ssm = validate_and_truncate_ssm(mean, modes, eigenvalues, settings.variance_keep)
@@ -1031,72 +1062,105 @@ def run_completion(
             landmark_sigma=landmark_sigma,
             refine_landmark_sigma=landmark_sigma,
         )
-    pose = rustcpd_module.pose_initialize(
-        working_mean,
-        working_target,
-        working_modes_flat,
-        ssm.eigenvalues,
-        **pose_kwargs,
-    )
+    if settings.pipeline == "robust":
+        try:  # Slicer imports this file as Resources.Python.MorphoWeaveShapeCompletionCore
+            from .MorphoWeaveShapeCompletionPipeline import register_robust
+        except ImportError:  # standalone / tests: Resources/Python on sys.path
+            from MorphoWeaveShapeCompletionPipeline import register_robust
 
-    # Continue the annealing where the pose search left it. rustcpd's default
-    # initializer measures the spread of the *whole* model against the target;
-    # for a fragment that is far too soft and the first M-steps pull the model
-    # back toward centring on the fragment, discarding the pose just found.
-    atlas_sigma2 = None
-    if settings.atlas_sigma2_from_pose_factor is not None:
-        posed_model = apply_similarity(
-            working_mean + working_modes @ np.asarray(pose.coefficients, dtype=np.float64),
-            float(pose.scale if with_scale else 1.0),
-            np.asarray(pose.rotation, dtype=np.float64),
-            np.asarray(pose.translation, dtype=np.float64).reshape(3),
+        landmark_kwargs = {}
+        pose_landmark_kwargs = {}
+        if use_landmarks:
+            landmark_kwargs = dict(
+                landmark_indices=landmark_indices, landmark_targets=landmark_targets, landmark_sigma=landmark_sigma
+            )
+            pose_landmark_kwargs = dict(landmark_kwargs, refine_landmark_sigma=landmark_sigma)
+        robust = register_robust(
+            core=sys.modules[__name__],
+            rustcpd_module=rustcpd_module,
+            settings=settings,
+            ssm=ssm,
+            target_full=target_full,
+            target=target,
+            source_centroid=source_centroid,
+            target_centroid=target_centroid,
+            template_points=None if template_points is None else _points(template_points, "template points"),
+            landmark_kwargs=landmark_kwargs,
+            pose_landmark_kwargs=pose_landmark_kwargs,
         )
-        _, nearest = nearest_indices(posed_model, working_target)
-        mean_square = float(np.mean(nearest * nearest))
-        if np.isfinite(mean_square) and mean_square > 0.0:
-            atlas_sigma2 = float(settings.atlas_sigma2_from_pose_factor) * mean_square
+        pose, fit = robust["pose"], robust["fit"]
+        working_mean, working_modes = robust["working_mean"], robust["working_modes"]
+        working_modes_flat, working_target = robust["working_flat"], robust["working_target"]
+        source_scale, scale_bounds = robust["source_scale"], robust["scale_bounds"]
+        atlas_sigma2 = None
+    else:
+        pose = rustcpd_module.pose_initialize(
+            working_mean,
+            working_target,
+            working_modes_flat,
+            ssm.eigenvalues,
+            **pose_kwargs,
+        )
 
-    # rustcpd's explicit sigma2 is in its working frame. Preserve the
-    # original coefficient/eigenvalue convention; native normalization
-    # transforms mean, modes, landmarks and returned geometry internally.
-    atlas_target_radius = rms_radius(working_target)
-    if not np.isfinite(atlas_target_radius) or atlas_target_radius <= 0.0:
-        raise ValueError("cannot normalize a zero-radius target fragment")
-    atlas_working_sigma2 = (
-        None if atlas_sigma2 is None else atlas_sigma2 / atlas_target_radius**2
-    )
-    atlas_kwargs: dict[str, Any] = {
-        "sigma2": atlas_working_sigma2,
-        "lambda_regularization": float(settings.atlas_lambda),
-        "normalize": True,
-        "optimize_similarity": True,
-        "with_scale": bool(with_scale),
-        "initial_coefficients": np.asarray(pose.coefficients, dtype=np.float64),
-        "initial_rotation": np.asarray(pose.rotation, dtype=np.float64),
-        "initial_scale": float(pose.scale if with_scale else 1.0),
-        "initial_translation": np.asarray(pose.translation, dtype=np.float64).reshape(-1),
-        "max_iterations": int(settings.atlas_max_iterations),
-        "tolerance": float(settings.atlas_tolerance),
-        "outlier_weight": float(settings.atlas_outlier_weight),
-        "k": None if settings.atlas_k is None else int(settings.atlas_k),
-        "parallel": bool(settings.parallel),
-        "single_precision": bool(settings.single_precision),
-        "scale_bounds": scale_bounds,
-        "adaptive_mixing": settings.adaptive_mixing,
-    }
-    if use_landmarks:
-        atlas_kwargs.update(
-            landmark_indices=landmark_indices,
-            landmark_targets=landmark_targets,
-            landmark_sigma=landmark_sigma,
+        # Continue the annealing where the pose search left it. rustcpd's default
+        # initializer measures the spread of the *whole* model against the target;
+        # for a fragment that is far too soft and the first M-steps pull the model
+        # back toward centring on the fragment, discarding the pose just found.
+        atlas_sigma2 = None
+        if settings.atlas_sigma2_from_pose_factor is not None:
+            posed_model = apply_similarity(
+                working_mean + working_modes @ np.asarray(pose.coefficients, dtype=np.float64),
+                float(pose.scale if with_scale else 1.0),
+                np.asarray(pose.rotation, dtype=np.float64),
+                np.asarray(pose.translation, dtype=np.float64).reshape(3),
+            )
+            _, nearest = nearest_indices(posed_model, working_target)
+            mean_square = float(np.mean(nearest * nearest))
+            if np.isfinite(mean_square) and mean_square > 0.0:
+                atlas_sigma2 = float(settings.atlas_sigma2_from_pose_factor) * mean_square
+
+        # rustcpd's explicit sigma2 is in its working frame. Preserve the
+        # original coefficient/eigenvalue convention; native normalization
+        # transforms mean, modes, landmarks and returned geometry internally.
+        atlas_target_radius = rms_radius(working_target)
+        if not np.isfinite(atlas_target_radius) or atlas_target_radius <= 0.0:
+            raise ValueError("cannot normalize a zero-radius target fragment")
+        atlas_working_sigma2 = (
+            None if atlas_sigma2 is None else atlas_sigma2 / atlas_target_radius**2
         )
-    fit = rustcpd_module.register_atlas(
-        working_target,
-        working_mean,
-        working_modes_flat,
-        ssm.eigenvalues,
-        **atlas_kwargs,
-    )
+        atlas_kwargs: dict[str, Any] = {
+            "sigma2": atlas_working_sigma2,
+            "lambda_regularization": float(settings.atlas_lambda),
+            "normalize": True,
+            "optimize_similarity": True,
+            "with_scale": bool(with_scale),
+            "initial_coefficients": np.asarray(pose.coefficients, dtype=np.float64),
+            "initial_rotation": np.asarray(pose.rotation, dtype=np.float64),
+            "initial_scale": float(pose.scale if with_scale else 1.0),
+            "initial_translation": np.asarray(pose.translation, dtype=np.float64).reshape(-1),
+            "max_iterations": int(settings.atlas_max_iterations),
+            "tolerance": float(settings.atlas_tolerance),
+            "outlier_weight": float(settings.atlas_outlier_weight),
+            "k": None if settings.atlas_k is None else int(settings.atlas_k),
+            "parallel": bool(settings.parallel),
+            "single_precision": bool(settings.single_precision),
+            "scale_bounds": scale_bounds,
+            "adaptive_mixing": settings.adaptive_mixing,
+        }
+        if use_landmarks:
+            atlas_kwargs.update(
+                landmark_indices=landmark_indices,
+                landmark_targets=landmark_targets,
+                landmark_sigma=landmark_sigma,
+            )
+        fit = rustcpd_module.register_atlas(
+            working_target,
+            working_mean,
+            working_modes_flat,
+            ssm.eigenvalues,
+            **atlas_kwargs,
+        )
+
     posterior = fit.posterior(
         working_target,
         working_mean,

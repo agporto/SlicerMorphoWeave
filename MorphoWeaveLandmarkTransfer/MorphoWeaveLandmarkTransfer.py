@@ -57,6 +57,39 @@ def target_count_voxel_size(points, target_count, tolerance=0.02, max_iterations
 
   return best_size
 
+def voxel_downsample_np(points, voxel_size):
+  """Centroid per occupied voxel (same reduction as Open3D/tiny3d voxel_down_sample)."""
+  points = np.asarray(points, dtype=np.float64)
+  keys = np.floor((points - points.min(axis=0)) / float(voxel_size)).astype(np.int64)
+  _, inverse, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
+  inverse = inverse.reshape(-1)
+  sums = np.zeros((len(counts), 3))
+  np.add.at(sums, inverse, points)
+  return sums / counts[:, None]
+
+def _import_global_pose_search():
+  try:  # Slicer: scripted-module Resources are merged as a namespace package
+    from Resources.Python.MorphoWeaveShapeCompletionPipeline import global_pose_search
+  except ImportError:  # standalone use with MorphoWeaveShapeCompletion/Resources/Python on sys.path
+    from MorphoWeaveShapeCompletionPipeline import global_pose_search
+  return global_pose_search
+
+def _penalized_cpd_nll(target, fitted, sigma2, outlier_weight, coefficients, eigenvalues, lam):
+  """CPD mixture negative log-likelihood of `target` under the fitted model plus the
+  shape prior; comparable between candidate fits to the same target cloud."""
+  x = np.asarray(target, np.float64); y = np.asarray(fitted, np.float64)
+  m, d = y.shape; sigma2 = max(float(sigma2), 1e-300); w = float(outlier_weight)
+  base = np.log(max(1.0 - w, 1e-300)) - np.log(m) - 0.5 * d * np.log(2.0 * np.pi * sigma2)
+  out = (np.log(w) - np.log(max(float(np.prod(np.ptp(x, axis=0))), 1e-300))) if w > 0 else -np.inf
+  total = 0.0
+  for start in range(0, len(x), 512):
+    d2 = np.sum((x[start:start+512, None, :] - y[None]) ** 2, axis=2)
+    comp = base - d2 / (2.0 * sigma2)
+    top = np.maximum(comp.max(axis=1), out)
+    total -= float(np.sum(top + np.log(np.exp(comp - top[:, None]).sum(axis=1) + np.exp(out - top))))
+  b = np.asarray(coefficients, np.float64)
+  return total + 0.5 * float(lam) * float(np.sum(b * b / np.asarray(eigenvalues, np.float64)))
+
 def setWorkflowStatus(label, state, detail):
   title, color = {
     "needs_input": ("Needs input", "#c75b5b"),
@@ -287,7 +320,9 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
   PARAMS = [
     {"key":"skipScaling","kind":"check","label":"Skip scaling","section":"General Settings","value":False},
     {"key":"skipProjection","kind":"check","label":"Skip projection","section":"General Settings","value":True},
-    {"key":"skipOptimization","kind":"check","label":"Skip template optimization (batch)","section":"General Settings","value":False},
+    {"key":"skipOptimization","kind":"check","label":"Skip template optimization (batch)","section":"General Settings","value":True},
+    {"key":"featureFreeRigid","kind":"check","label":"SSM global pose search (no FPFH/RANSAC; shared with Shape Completion)","section":"Rigid registration","value":True},
+    {"key":"rigidSearch","kind":"check","label":"Robust rigid search (RANSAC/ICP + pose EM, best SSM likelihood)","section":"Rigid registration","value":True},
     {"key":"targetCoverage","kind":"dspin","label":"Target completeness (linear fraction)","section":"General Settings", "min":0.05,"max":1.0,"step":0.01,"value":1.0,"decimals":2},
     {"key":"registrationPointCount","kind":"spin","label":"Target registration points","section":"Point sampling and max projection","min":100,"max":1_000_000,"step":100,"value":2000,
      "tooltip":"Target size for temporary registration clouds. Values below 1,600 limit Pose-EM refinement."},
@@ -304,13 +339,13 @@ class MorphoWeaveLandmarkTransferWidget(ScriptedLoadableModuleWidget):
     {"key":"tpsLambda","kind":"dspin","label":"TPS smoothing (λ)","section":"Deformation backend","min":0.0,"max":10.0,"step":0.01,"value":0.0,
      "tooltip":"Zero interpolates controls; increasing positive values damps non-affine deformation toward an affine fit."},
     {"key":"tpsMaxCorr","kind":"spin","label":"TPS max constraints","section":"Deformation backend","min":20,"max":5000,"step":20,"value":800},
-    {"key":"alpha","kind":"dspin","label":"Rigidity (alpha)","section":"PCA-CPD registration","min":0.1,"max":10.0,"step":0.1,"value":2.0},
+    {"key":"alpha","kind":"dspin","label":"Rigidity (alpha)","section":"PCA-CPD registration","min":0.1,"max":50.0,"step":0.1,"value":8.0},
     {"key":"beta","kind":"dspin","label":"Motion coherence (beta)","section":"PCA-CPD registration","min":0.1,"max":10.0,"step":0.1,"value":2.0},
     {"key":"skipFineCPD","kind":"check", "label":"Fossil mode (SSM-only)", "section":"PCA-CPD registration","value":False},
     {"key":"w","kind":"dspin","label":"Outlier weight (w)","section":"PCA-CPD registration","min":0.0,"max":0.5,"step":0.01,"value":0.10,"decimals":3},
     {"key":"tolerance","kind":"dspin","label":"Tolerance","section":"PCA-CPD registration","min":1e-8,"max":1e-2,"step":1e-6,"value":1e-6,"decimals":8},
     {"key":"max_iterations","kind":"spin","label":"Max iterations","section":"PCA-CPD registration","min":100,"max":1000,"step":50,"value":250},
-    {"key":"lambda_reg","kind":"dspin","label":"SSM weight (lambda_reg)","section":"PCA-CPD registration","min":0.0,"max":5.0,"step":0.01,"value":0.01}
+    {"key":"lambda_reg","kind":"dspin","label":"SSM weight (lambda_reg)","section":"PCA-CPD registration","min":0.0,"max":50.0,"step":0.01,"value":1.0}
   ]
 
   def _make_selector(self, types, attr_key=None, attr_val=None, tooltip=None, none=True, select_new=False):
@@ -1153,8 +1188,11 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
     unprocessed is the number of targets never started. Successfully written
     files are retained and listed even if a later output for that target fails.
     """
-    import tiny3d as t3d
-    t3d.utility.random.seed(int(42))
+    needs_tiny3d = (not bool(parameters.get("featureFreeRigid", True))) or (
+      not bool(parameters.get("skipOptimization", True)) and not pose_em_enabled(parameters, skip_optimization=False))
+    if needs_tiny3d:  # FPFH/RANSAC rigid stage or the legacy template optimizer
+      import tiny3d as t3d
+      t3d.utility.random.seed(int(42))
     parameters = dict(parameters)
     parameters["skipScaling"] = bool(skipScaling)
     skipOpt = bool(parameters.get("skipOptimization", False))
@@ -1302,12 +1340,25 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
             with slicer.util.NodeModify(tpl_corr): slicer.util.updateMarkupsControlPointsFromArray(tpl_corr, corr_np)
             with slicer.util.NodeModify(tpl_lm):   slicer.util.updateMarkupsControlPointsFromArray(tpl_lm,   lm_np)
           if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
-          if status_callback: status_callback(f"[{i+1}/{total}] Subsample & features…")
-          if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
-          _src_pc,_tgt_pc,src_down,tgt_down,src_fpfh,tgt_fpfh,voxel=self.runSubsample(tpl_model, tgt_node, skipScaling, parameters)
-          if status_callback: status_callback(f"[{i+1}/{total}] RANSAC+ICP rigid…")
-          if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
-          M_icp=_mat4(self.estimateTransform(src_down, tgt_down, src_fpfh, tgt_fpfh, voxel, parameters))
+          robust_deformed = None
+          if bool(parameters.get("featureFreeRigid", True)):
+            # SSM-only global search shared with Shape Completion (no FPFH/RANSAC/tiny3d).
+            if status_callback: status_callback(f"[{i+1}/{total}] SSM global pose search…")
+            target_points = self.subsampleTargetPoints(tgt_node, parameters)
+            if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
+            M_icp = self.estimateRigidSSM(corr_np, target_points, ssmData, parameters, scale=s)
+          else:
+            if status_callback: status_callback(f"[{i+1}/{total}] Subsample & features…")
+            if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
+            _src_pc,_tgt_pc,src_down,tgt_down,src_fpfh,tgt_fpfh,voxel=self.runSubsample(tpl_model, tgt_node, skipScaling, parameters)
+            target_points = np.asarray(tgt_down.points)
+            if status_callback: status_callback(f"[{i+1}/{total}] RANSAC+ICP rigid…")
+            if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
+            M_icp=_mat4(self.estimateTransform(src_down, tgt_down, src_fpfh, tgt_fpfh, voxel, parameters))
+          if (not bool(parameters.get("featureFreeRigid", True))) and bool(parameters.get("rigidSearch", True)):
+            if status_callback: status_callback(f"[{i+1}/{total}] Robust rigid selection (RANSAC vs pose EM)…")
+            M_icp, robust_deformed, _label = self.estimateRigidRobust(
+              corr_np, M_icp, target_points, ssmData, parameters, scale=s)
           if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
           if need_final_mesh or use_bih:
             tpl_model.SetAndObservePolyData(_apply_pd_transform(tpl_model.GetPolyData(), M_icp))
@@ -1319,7 +1370,10 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
           if status_callback: status_callback(f"[{i+1}/{total}] PCA-CPD deformable…")
           if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
           aligned_corr=corr_np
-          deformed_corr=self.runDeformable(tableNode=tableNode, sourceLM=aligned_corr, scale=s, targetSLM=np.asarray(tgt_down.points), parameters=parameters, rigidMatrix=M_icp, ssmData=ssmData)
+          if robust_deformed is not None:
+            deformed_corr=robust_deformed
+          else:
+            deformed_corr=self.runDeformable(tableNode=tableNode, sourceLM=aligned_corr, scale=s, targetSLM=target_points, parameters=parameters, rigidMatrix=M_icp, ssmData=ssmData)
           if cancel_callback and cancel_callback(): raise KeyboardInterrupt("Cancel requested")
           pred_np = None
           if use_bih:
@@ -1462,7 +1516,6 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
     return mean, modes[:, :, :k], eig[:k]
 
   def _pose_em_target_points(self, targetModelNode, parameters):
-    import tiny3d as t3d
     target = np.asarray(slicer.util.arrayFromModelPoints(targetModelNode), dtype=float)
     if target.ndim != 2 or target.shape[1] != 3 or len(target) == 0:
       raise ValueError("Pose EM requires a non-empty target model.")
@@ -1476,9 +1529,7 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
       voxel = diag / (55.0 * max(float(parameters.get("pointDensity", 1.3)), 0.1))
     if voxel <= np.finfo(float).eps:
       return target
-    cloud = t3d.geometry.PointCloud(); cloud.points = t3d.utility.Vector3dVector(target)
-    down = cloud.voxel_down_sample(voxel)
-    points = np.asarray(down.points, dtype=float)
+    points = voxel_downsample_np(target, voxel)
     return points if len(points) else target
 
   def runPoseEMDeformable(self, tableNode, targetSLM, parameters, ssmData=None):
@@ -1607,7 +1658,7 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
 
   def runDeformable(self, tableNode, sourceLM, scale, targetSLM, parameters, rigidMatrix=None, ssmData=None):
       import rustcpd
-      if tableNode is None: raise ValueError("runDeformable requires tableNode to be set")
+      if tableNode is None and ssmData is None: raise ValueError("runDeformable requires tableNode or ssmData")
 
       # Keep SSM geometry consistent with the (already scaled) sourceLM
       ssmData = self._get_ssm_base(tableNode) if ssmData is None else ssmData
@@ -1657,14 +1708,16 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
       cov = float(parameters.get("targetCoverage", 1.0))
       is_complete = abs(cov - 1.0) < 1e-6   # or: np.isclose(cov, 1.0)
       sparse_k = max(1, min(10, len(tgt_n)))
+      outlier_w = float(parameters.get("w", 0.10))
+      lam = float(parameters.get("lambda_reg", 1.0))
 
       pca = rustcpd.register_atlas(
           np.asarray(tgt_n),             # scaled target
           np.asarray(src_n),             # source is the SSM base
           U_aligned,
-          eigvals_eff,                   # no external scaling/flooring
-          lambda_regularization=float(parameters.get("lambda_reg", 0.01)),
-          outlier_weight=float(parameters.get("w", 0.10)),
+          eigvals_eff,
+          lambda_regularization=lam,
+          outlier_weight=outlier_w,
           tolerance=float(parameters.get("tolerance", 1e-6)),
           max_iterations=int(parameters.get("max_iterations", 250)),
           with_scale=is_complete,
@@ -1673,6 +1726,9 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
           k=sparse_k,
           kdtree_radius_scale=10.0,
       )
+      self._last_atlas_score = _penalized_cpd_nll(
+          np.asarray(tgt_n), np.asarray(pca.points), float(pca.sigma2), outlier_w,
+          np.asarray(pca.coefficients), eigvals_eff, lam)
       warped_landmarks = np.asarray(pca.points)
 
       if bool(parameters.get("skipFineCPD", False)):
@@ -1682,7 +1738,8 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
           np.asarray(tgt_n),
           warped_landmarks,
           beta=float(parameters.get("beta", 2.0)),
-          alpha=float(parameters.get("alpha", 2.0)),
+          alpha=float(parameters.get("alpha", 8.0)),
+          outlier_weight=outlier_w,
           low_rank=max(1, min(300, len(warped_landmarks))),
           tolerance=float(parameters.get("tolerance", 1e-6)),
           max_iterations=int(parameters.get("max_iterations", 250)),
@@ -2068,6 +2125,77 @@ class MorphoWeaveLandmarkTransferLogic(ScriptedLoadableModuleLogic):
       sourcePoints, targetPoints, voxelSize * parameters["ICPDistanceThreshold"], best_result.transformation,
       t3d.pipelines.registration.TransformationEstimationPointToPlane())
     return icp.transformation
+
+  def poseEMRigidMatrix(self, sourceCorr, targetPoints, ssmData, parameters, scale=1.0):
+    """4x4 (column convention) similarity from rustcpd's pose-marginalized search,
+    mapping the pre-scaled template correspondences onto the target points."""
+    import rustcpd
+    eig = np.asarray(ssmData["eig"], float)
+    k = int(np.searchsorted(np.cumsum(eig), float(parameters.get("variance_keep", 0.95)) * eig.sum()) + 1)
+    k = max(1, min(k, eig.size))
+    U = np.asarray(ssmData["U"], float)[:, :, :k].reshape(-1, k)
+    src = np.asarray(sourceCorr, float); tgt = np.asarray(targetPoints, float)
+    cs, ct = src.mean(0), tgt.mean(0)
+    pose = rustcpd.pose_initialize(src - cs, tgt - ct, U, eig[:k] * float(scale) ** 2,
+                                   rotation_count=193, coarse_source_count=400, coarse_target_count=400,
+                                   coarse_rank=12, refine_count=12, refine_target_count=1600, refine_iterations=30,
+                                   lambda_regularization=5.0, outlier_weight=0.15, with_scale=True, seed=0)
+    R = np.asarray(pose.rotation, float); sc = float(pose.scale); t = np.asarray(pose.translation, float).reshape(3)
+    M = np.eye(4); M[:3, :3] = sc * R.T; M[:3, 3] = t + ct - sc * (cs @ R)
+    return M
+
+  def subsampleTargetPoints(self, targetNode, parameters):
+    """Voxel-downsample the target mesh to ~registrationPointCount points (NumPy; no tiny3d)."""
+    points = np.asarray(slicer.util.arrayFromModelPoints(targetNode), dtype=float)
+    voxel = target_count_voxel_size(points, int(parameters.get("registrationPointCount", 2000)))
+    return voxel_downsample_np(points, voxel)
+
+  def estimateRigidSSM(self, corrPoints, targetPoints, ssmData, parameters, scale=1.0):
+    """4x4 (column convention) similarity mapping the pre-scaled template correspondences
+    onto the target, from the SSM-only global search of MorphoWeaveShapeCompletion."""
+    import rustcpd
+    global_pose_search = _import_global_pose_search()
+    eig = np.asarray(ssmData["eig"], float)
+    k = int(np.searchsorted(np.cumsum(eig), float(parameters.get("variance_keep", 0.95)) * eig.sum()) + 1)
+    k = max(1, min(k, eig.size))
+    modes = np.asarray(ssmData["U"], float)[:, :, :k].reshape(-1, k)
+    src = np.asarray(corrPoints, float); tgt = np.asarray(targetPoints, float)
+    cs, ct = src.mean(0), tgt.mean(0)
+    cov = float(np.clip(float(parameters.get("targetCoverage", 1.0)), 1e-3, 1.0))
+    search = global_pose_search(rustcpd, src - cs, tgt - ct, modes, eig[:k] * float(scale) ** 2,
+                                coverage=cov, seed=0)
+    fit = search["fit"]
+    R = np.asarray(fit.rotation, float); sc = float(fit.scale); t = np.asarray(fit.translation, float).reshape(3)
+    M = np.eye(4); M[:3, :3] = sc * R.T; M[:3, 3] = t + ct - sc * (cs @ R)
+    self.last_rigid_info = {"rigid": "ssm_search", "chosen": search["chosen"], "candidates": int(search["candidates"])}
+    return M
+
+  def estimateRigidRobust(self, corr_np, ransacMatrix, targetPoints, ssmData, parameters, scale=1.0):
+    """Choose between the RANSAC/ICP pose and the pose-EM pose by the penalized CPD
+    likelihood of the SSM atlas fit started from each. Returns (matrix, deformed_corr, label)."""
+    def _apply(P, M4):
+      P = np.asarray(P, np.float64); return (np.c_[P, np.ones((len(P), 1))] @ np.asarray(M4, float).T)[:, :3]
+    candidates = [("ransac", as_np4x4(ransacMatrix))]
+    try:
+      candidates.append(("pose_em", self.poseEMRigidMatrix(corr_np, targetPoints, ssmData, parameters, scale)))
+    except Exception as e:
+      logging.warning(f"[rigid] pose EM unavailable: {e}")
+    # Score each candidate with the SSM stage only (the likelihood is computed there),
+    # then run the full deformable stage once, from the winning pose.
+    scoring = dict(parameters); scoring["skipFineCPD"] = True
+    best = None
+    for label, M in candidates:
+      aligned = _apply(corr_np, M)
+      self.runDeformable(tableNode=None, sourceLM=aligned, scale=scale, targetSLM=targetPoints,
+                         parameters=scoring, rigidMatrix=M, ssmData=ssmData)
+      score = float(getattr(self, "_last_atlas_score", 0.0))
+      if best is None or score < best[0]:
+        best = (score, M, None, label)
+    aligned = _apply(corr_np, best[1])
+    deformed = self.runDeformable(tableNode=None, sourceLM=aligned, scale=scale, targetSLM=targetPoints,
+                                  parameters=parameters, rigidMatrix=best[1], ssmData=ssmData)
+    best = (best[0], best[1], deformed, best[3])
+    return best[1], best[2], best[3]
 
   def runSubsample(self, sourceNode, targetNode, skipScaling, parameters):
     import tiny3d as t3d

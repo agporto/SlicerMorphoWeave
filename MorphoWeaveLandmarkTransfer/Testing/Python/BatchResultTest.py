@@ -42,6 +42,9 @@ class BatchResultTest(unittest.TestCase):
         cloud = SimpleNamespace(points=self.vertices.copy())
         self.logic.runSubsample = lambda *args: (None, None, cloud, cloud, None, None, .1)
         self.logic.estimateTransform = lambda *args: np.eye(4)
+        # Default SSM-only rigid stage (featureFreeRigid): same boundary doubles.
+        self.logic.subsampleTargetPoints = lambda node, parameters: self.vertices.copy()
+        self.logic.estimateRigidSSM = lambda *args, **kwargs: np.eye(4)
         self.logic.runDeformable = lambda **kwargs: kwargs["sourceLM"].copy()
         self.logic.propagateLandmarkTypes = lambda *args: None
         tiny3d = SimpleNamespace(utility=SimpleNamespace(random=SimpleNamespace(seed=lambda seed: None)))

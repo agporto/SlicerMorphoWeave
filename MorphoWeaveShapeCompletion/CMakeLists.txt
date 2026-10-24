@@ -15,6 +15,7 @@ set(MODULE_PYTHON_RESOURCES
   Resources/Icons/${MODULE_NAME}.png
   Resources/Python/MorphoWeaveShapeCompletionCore.py
   Resources/Python/MorphoWeaveShapeCompletionGeometry.py
+  Resources/Python/MorphoWeaveShapeCompletionPipeline.py
   Resources/Python/MorphoWeaveShapeCompletionBase.py
   Resources/Python/MorphoWeaveShapeCompletionBatch.py
   Resources/Python/MorphoWeaveCompletionBatch.py

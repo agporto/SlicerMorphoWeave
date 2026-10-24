@@ -104,7 +104,7 @@ class PoseEMTemplateUnitTest(unittest.TestCase):
         self.assertNotIn("blas_threads_limited", source)
         self.assertNotIn("dense_completion_skipped", source)
         self.assertNotIn("downstream_rigid", source)
-        self.assertIn('parameters.get("lambda_reg", 0.01)', source)
+        self.assertIn('parameters.get("lambda_reg", 1.0)', source)  # unit-consistent prior (eigenvalues in the s20 frame)
         self.assertIn('parameters.get("w", 0.10)', source)
         self.assertIn('parameters.get("max_iterations", 250)', source)
         self.assertIn('"key":"registrationPointCount"', source)

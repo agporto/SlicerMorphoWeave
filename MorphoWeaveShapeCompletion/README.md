@@ -30,6 +30,35 @@ The module runs in either mode:
 
 Landmark mode is strict: when selected, an invalid or absent landmark match stops the run rather than silently reverting to surface-only completion.
 
+## Robust registration pipeline (default)
+
+**Advanced → Registration pipeline** selects **Robust (recommended)** (default) or **Legacy**. Legacy is the registration path described below and is unchanged (bit-identical to the correctness-audit branch). Robust (`CompletionSettings(pipeline="robust")`, implemented in `Resources/Python/MorphoWeaveShapeCompletionPipeline.py`) changes four things:
+
+1. **Size.** The SSM pre-scale is the geometric mean of a convex-hull-volume estimate, `∛(V_hull(fragment) / (coverage · V_hull(template surface)))`, and the coverage-consistent radii estimate. The residual scale is bounded to (0.9, 1/0.9). The hull volume is insensitive to vertex noise and mesh resolution; triangle area is not.
+2. **Global pose search (`global_pose_search`, shared with Landmark Transfer):**
+   - 4 independent pose-marginalized searches (seeds), each continued to a full atlas fit from its `AtlasState`, with adaptive mixing;
+   - 16 SSM-region proposals: coverage-consistent cuts of the mean shape that resemble the fragment, aligned by principal axes. For complete targets these reduce to the 4 principal-axis alignments.
+   - Proposals are screened on 400-point subsamples, the best 2 are refined, and the fit with the lowest penalized CPD negative log-likelihood is kept.
+   - No feature matching is needed. FPFH/RANSAC proposals remain available with `robust_ransac_hypotheses > 0` (requires tiny3d).
+3. **Density-matched refit.** The fragment is resampled to follow the fitted model-point density, which reduces correspondence sliding.
+4. **Posterior.** `prior_temperature = λ`, as in Legacy.
+
+The Robust path requires the template surface points, which the widget passes automatically.
+
+**Held-out evaluation** (leave-one-unit-out SSMs; 40 test units each of mouse skulls, primate molars and lizard vertebrae; random 3-D pose and ±10% scale). Each dataset contributes 15 fragments per unit: plane caps, central patches and peripheral patches at 20–80% coverage. Failure means missing-region error > 50% of the RMS radius.
+
+| | Legacy | Robust |
+|---|---|---|
+| Fragment failures (all coverages) | 52.6% | **23.7%** |
+| 45% coverage, mouse / molar / vertebrae | 40 / 68 / 72% | **1 / 12 / 39%** |
+| 60% coverage | 3 / 23 / 31% | **0 / 3 / 13%** |
+| Complete-shape failures | 0 / 2.5 / 10% | **0 / 0 / 0%** |
+| Complete-shape homologous error (% radius) | 2.98 / 9.63 / 8.28 | **2.59 / 8.40 / 8.14** |
+| Mouse fragment failures with 2% vertex noise | 57% | **3%** |
+| Median single-thread time per fragment | ~6 s | ~38 s (`robust_pose_seeds=2`: ~23 s) |
+
+Small (≤ 30%) or far off-centre fragments remain hard, especially for vertebrae. Use landmarks there. Raw model variances are not calibrated intervals: use the Calibration tab.
+
 ## Length units and the final atlas fit
 
 The final atlas stage now uses the same normalized-coordinate convention as pose

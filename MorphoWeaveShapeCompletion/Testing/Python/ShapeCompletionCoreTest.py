@@ -350,6 +350,52 @@ class ShapeCompletionCoreUnitTest(unittest.TestCase):
         self.assertLess(abs(result.world_scale - 1.0), 0.05)
         self.assertLess(result.atlas.sigma2, 0.05)
 
+    def test_hull_scale_recovers_known_scale_and_ignores_noise(self):
+        from MorphoWeaveShapeCompletionPipeline import hull_scale
+        rng = np.random.default_rng(3)
+        template = rng.normal(size=(4000, 3)) * np.array([3.0, 1.5, 1.0])
+        template /= np.linalg.norm(template, axis=1, keepdims=True) / np.array([3.0, 1.5, 1.0])
+        self.assertAlmostEqual(hull_scale(1.7 * template, template, 1.0), 1.7, places=6)
+        noisy = 1.7 * template + rng.normal(scale=0.02, size=template.shape)
+        self.assertLess(abs(hull_scale(noisy, template, 1.0) / 1.7 - 1.0), 0.03)
+
+    def test_robust_pipeline_places_displaced_fragment_with_real_rustcpd(self):
+        try:
+            import rustcpd
+        except ImportError:  # pragma: no cover - optional dependency
+            self.skipTest("rustcpd is not installed")
+        rng = np.random.default_rng(11)
+        m = 600
+        z = np.sort(rng.uniform(0, 1, m))
+        theta = rng.uniform(0, 2 * np.pi, m)
+        radius = 4 + 6 * z + 9 * np.exp(-(((z - 0.06) / 0.06) ** 2))
+        mean = np.column_stack((100 * z, radius * np.cos(theta), radius * np.sin(theta)))
+        modes = np.zeros((m, 3, 2))
+        modes[:, 1, 0] = np.sin(np.pi * z)
+        modes[:, 2, 1] = np.sin(2 * np.pi * z)
+        flat = modes.reshape(3 * m, 2)
+        modes = (flat / np.linalg.norm(flat, axis=0)).reshape(m, 3, 2)
+        eigenvalues = np.array([9.0, 4.0])
+        truth = mean + modes @ np.array([1.5, -1.0])
+        angle = 0.5
+        rotation = np.array([[np.cos(angle), -np.sin(angle), 0], [np.sin(angle), np.cos(angle), 0], [0, 0, 1]])
+        posed = truth @ rotation + np.array([30.0, -20.0, 10.0])
+        selector = z < 0.33
+        fragment = posed[selector] + rng.normal(scale=0.05, size=(int(selector.sum()), 3))
+        settings = CompletionSettings(
+            coverage=0.33, pipeline="robust", target_point_count=200, rotation_count=25,
+            coarse_source_count=300, coarse_target_count=200, coarse_rank=2, refine_count=6,
+            refine_target_count=200, refine_iterations=25, atlas_max_iterations=100,
+            robust_ransac_hypotheses=0, robust_pose_seeds=1, robust_region_proposals=0, robust_density_refit=False, parallel=False,
+        )
+        result = run_completion(fragment, mean, modes, eigenvalues, settings, rustcpd_module=rustcpd,
+                                template_points=mean)
+        axis = np.array([1.0, 0.0, 0.0]) @ rotation
+        axial_error = float(np.mean(np.abs((result.completed_points - posed) @ axis)))
+        self.assertLess(axial_error, 1.0, f"fragment not placed at the proximal end: {axial_error} mm")
+        # Matched prior temperature: the posterior mean is the atlas estimate.
+        self.assertLess(result.posterior_mean_rms_from_atlas, 1e-3 * bbox_diagonal(mean))
+
     def test_ssm_validation_and_truncation(self):
         mean, modes, eigenvalues = synthetic_ssm()
         ssm = validate_and_truncate_ssm(mean, modes, eigenvalues, 0.75)

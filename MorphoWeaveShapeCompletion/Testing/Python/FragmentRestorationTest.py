@@ -4,6 +4,11 @@ The registration backend is a deterministic test double, not native rustcpd.
 VTK I/O, argument preparation, batch orchestration and the restored numerical
 Python code are real. This does not certify anatomical/native fitting accuracy.
 """
+import scipy.spatial  # noqa: F401  (load before tests patch sys.modules)
+try:  # real native backend, for the robust-pipeline test (tests below swap in a fake)
+    import rustcpd as _NATIVE_RUSTCPD
+except ImportError:  # pragma: no cover
+    _NATIVE_RUSTCPD = None
 import ast
 import copy
 import hashlib
@@ -216,6 +221,10 @@ class FragmentRestorationTest(unittest.TestCase):
         self.widget.output_directory.setCurrentPath(str(self.directory/'single'))
         # Deliberately doubled backend; preflight itself is tested separately.
         self.widget._ensure_dependencies=lambda:True
+        # These restoration tests assert the exact native calls of the legacy
+        # registration path through a fake backend; the Robust default (separate
+        # pipeline module) is exercised with the native backend below.
+        self.widget.pipeline_combo.setCurrentIndex(1)
         logger=patch.object(self.adapter.logging,'exception'); logger.start(); self.addCleanup(logger.stop)
         self.packaging=packaging
 
@@ -255,7 +264,7 @@ class FragmentRestorationTest(unittest.TestCase):
 
     def test_surface_fragment_single_and_batch_match(self):
         calls=self.compare_paths()
-        self.assertEqual(calls[0][-1]['translation_anchor_count'],6)
+        self.assertEqual(calls[0][-1]['translation_anchor_count'],8)  # widget default (was 6)
         self.assertIsNotNone(calls[0][-1]['scale_bounds'])
         self.assertEqual(calls[0][-1]['scale_bounds'],calls[1][-1]['scale_bounds'])
         self.assertGreater(calls[1][-1]['sigma2'],0)
@@ -311,7 +320,8 @@ class FragmentRestorationTest(unittest.TestCase):
     def test_tabs_and_advanced_defaults(self):
         self.assertEqual([n for _,n in self.widget.tabs.entries],['Complete Shape','Batch','Optimize','Calibration','Advanced'])
         settings=self.widget._read_settings()
-        self.assertEqual(settings.translation_anchor_count,6);self.assertEqual(settings.residual_scale_policy,'auto')
+        self.assertEqual(settings.translation_anchor_count,8);  # robust-pipeline default (was 6)
+        self.assertEqual(settings.residual_scale_policy,'auto')
         self.assertEqual(settings.free_scale_bounds_fraction,0.1);self.assertEqual(settings.atlas_sigma2_from_pose_factor,2.0)
         self.assertIsNone(settings.adaptive_mixing);self.assertIsNone(settings.initial_sigma2)
     def test_metadata_and_discovery(self):
@@ -353,6 +363,23 @@ class FragmentRestorationTest(unittest.TestCase):
             content=(ROOT/relative).read_bytes()
             actual=hashlib.sha1(b'blob '+str(len(content)).encode()+b'\0'+content).hexdigest()
             self.assertEqual(actual,expected)
+
+    def test_robust_pipeline_single_and_batch_match_with_native_rustcpd(self):
+        if _NATIVE_RUSTCPD is None or getattr(_NATIVE_RUSTCPD, "__version__", "") != "4.0.0":
+            self.skipTest("native rustcpd 4.0.0 is not available")
+        sys.modules['rustcpd'] = _NATIVE_RUSTCPD
+        self.widget.pipeline_combo.setCurrentIndex(0)
+        settings = self.widget._read_settings()
+        self.assertEqual(settings.pipeline, 'robust')
+        self.widget._run_completion_impl()
+        self.widget.on_run_batch(); self.assertEqual(self.errors, [])
+        self.assertIn('1 success', self.widget.batch_status.text)
+        left = np.load(self.directory/'single/results.npz'); right = np.load(self.directory/'batch/fragment/results.npz')
+        for key in left.files:
+            np.testing.assert_array_equal(left[key], right[key])
+        self.assertEqual((self.directory/'single/diagnostics.json').read_bytes(),
+                         (self.directory/'batch/fragment/diagnostics.json').read_bytes())
+        self.assertTrue(np.all(np.isfinite(left['completed'])))
 
     def test_corrected_core_matches_documented_provenance(self):
         manifest = json.loads((ROOT/'RESTORATION_PROVENANCE.json').read_text())

@@ -150,11 +150,12 @@
       "MorphoWeaveShapeCompletionTest.runTest": "46dcc0b9e71cae582760175bd61378e515f821a438e5dff11b323d43c1dda648"
     },
     "intentional_changed_callables": {
-      "MorphoWeaveShapeCompletionWidget._build_advanced_ui": "16c0df436fab758d19662094cdfa47124e2a0d9f58ed6574745fc1c071009eae",
-      "MorphoWeaveShapeCompletionWidget._run_completion_impl": "ee38a1c6f9f63ceddd6202154e4505280b474faa481cb58faa332c832efb8b5f",
-      "MorphoWeaveShapeCompletionWidget._run_calibration_impl": "b7c51570d159ab229cac6755a1e2d7040a143d86a7fdc8f9ed9bc336d2a0565f"
+      "MorphoWeaveShapeCompletionWidget._build_advanced_ui": "a2360cc4f5d41d32b2d5a70832aa7ebe6831845708e64a820c7cd0f402403a76",
+      "MorphoWeaveShapeCompletionWidget._run_completion_impl": "132ea3a29774f34473b8bde4b07ae2b6d337277b463f6bd40c9700642c3becc1",
+      "MorphoWeaveShapeCompletionWidget._run_calibration_impl": "b30cf5dde8f2d1cc2c367bfd72240cfaef3b24031cb4f4299bddc38b9ed8cb9a",
+      "MorphoWeaveShapeCompletionWidget._read_settings": "3fc54b942f497b287db8d96001c99cc604ab2e55c24db527bdd4723a3d411950"
     },
-    "core_sha256": "3fa004796f16f08f5d93aacec2fa4ac837efaac8f6487c9d8fddba1c6644fe55",
+    "core_sha256": "a41487c991b9db743df1400e08abd6eeeaf0592584ecd63a0cdcd6c00f7fe8c6",
     "note": "Historical restoration fields above remain archival. Source-segment hashes avoid interpreter-version-dependent AST serialization. The correctness update intentionally changes prior semantics, profile provenance, and surface-distance calibration.",
     "audit_branch_update": {
       "algorithm_version": "3-normalized-atlas-triangle-validation",
@@ -164,6 +165,25 @@
         "Report AUC of fitted classifier probabilities."
       ],
       "native_dependency_fixes_included": false,
+      "live_slicer_tested": false
+    },
+    "robust_pipeline_update": {
+      "algorithm_version": "4-robust-pipeline-option",
+      "changes": [
+        "Add pipeline='robust' (MorphoWeaveShapeCompletionPipeline.register_robust / global_pose_search); widget default Robust; Legacy selectable and identical to the audit branch.",
+        "Size: geometric mean of convex-hull-volume and coverage-consistent radii scales; residual scale bounded to (0.9, 1/0.9).",
+        "Global search: 4 pose-EM lattices plus SSM-region / principal-axis proposals, selected by penalized CPD likelihood; atlas continued from AtlasState with adaptive mixing.",
+        "Density-matched refit; posterior prior temperature = lambda (as in the audit update).",
+        "Widget passes template surface points; translation seeds default 8."
+      ],
+      "changed_callables": [
+        "MorphoWeaveShapeCompletionWidget._build_advanced_ui",
+        "MorphoWeaveShapeCompletionWidget._read_settings",
+        "MorphoWeaveShapeCompletionWidget._run_completion_impl",
+        "MorphoWeaveShapeCompletionWidget._run_calibration_impl"
+      ],
+      "legacy_path_identical_to_audit_branch": true,
+      "native_rustcpd_tested": true,
       "live_slicer_tested": false
     }
   }
