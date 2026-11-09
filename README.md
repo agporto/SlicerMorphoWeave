@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="tutorial/README.md"><strong>Tutorial</strong></a> ·
+  <a href="tutorial/first-landmarks.md"><strong>Start here: your first landmark prediction</strong></a> ·
   <a href="https://github.com/agporto/SlicerMorphoWeave/issues"><strong>Issues</strong></a> ·
   <a href="https://discourse.slicer.org/"><strong>Slicer Forum</strong></a> ·
   <a href="https://youtu.be/OA_bfRgbKGs"><strong>Video</strong></a>
@@ -59,7 +59,7 @@ In Slicer, open **Developer Tools > Extension Wizard**, choose **Select Extensio
 3. **Landmark Transfer** transfers landmarks to individual specimens or batches using rigid registration, SSM-guided CPD, optional fine deformation, and surface projection.
 4. **Surface Segmentation** uses dense correspondences to divide homologous surface regions consistently across specimens.
 
-A complete illustrated walkthrough is available in the [MorphoWeave tutorial](tutorial/README.md).
+Follow [Your first landmark prediction](tutorial/first-landmarks.md) for a screen-by-screen exercise with mouse skulls.
 
 ## Modules
 
@@ -136,7 +136,8 @@ The Pose-marginalized EM backend is optional. The established FPFH + RANSAC temp
 
 ## Documentation and support
 
-- [MorphoWeave tutorial](tutorial/README.md)
+- [Your first landmark prediction](tutorial/first-landmarks.md)
+- [Detailed module walkthrough](tutorial/README.md)
 - [Issue tracker](https://github.com/agporto/SlicerMorphoWeave/issues)
 - [3D Slicer documentation](https://slicer.readthedocs.io/)
 - [SlicerMorph tutorials](https://github.com/SlicerMorph/Tutorials)
