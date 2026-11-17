@@ -171,12 +171,29 @@ Any opinions, findings, conclusions or recommendations expressed in this materia
 
 ## Citation
 
-Until the formal MorphoWeave publication is available, cite the software repository:
+If you use MorphoWeave, please cite the preprint:
 
 ```text
-Porto, A. MorphoWeave: Atlas-based 3D landmark transfer and statistical shape modeling.
-https://github.com/agporto/SlicerMorphoWeave
+Porto, A., Wolcott, K. A., Fenner, K. L., Gordon, C., Shi, B., & Stanley, E. L. (2026).
+Biology-guided machine learning for robust anatomical correspondence across biodiversity datasets.
+bioRxiv. https://doi.org/10.64898/2026.09.28.755222
 ```
+
+<details>
+<summary>BibTeX</summary>
+
+```bibtex
+@article{porto2026morphoweave,
+  title   = {Biology-guided machine learning for robust anatomical correspondence across biodiversity datasets},
+  author  = {Porto, Arthur and Wolcott, Katherine A. and Fenner, Kelsey L. and Gordon, Caleb and Shi, Breanna and Stanley, Edward L.},
+  journal = {bioRxiv},
+  year    = {2026},
+  doi     = {10.64898/2026.09.28.755222},
+  url     = {https://www.biorxiv.org/content/10.64898/2026.09.28.755222v1}
+}
+```
+
+</details>
 
 When using Atlas Builder, also cite the relevant SlicerDenseCorrespondenceAnalysis/DeCA software and publication. Please additionally cite the methods and software used by the relevant workflow, including 3D Slicer, SlicerMorph when used, and the `rustcpd` or `tiny3d-rs` documentation as appropriate.
 
